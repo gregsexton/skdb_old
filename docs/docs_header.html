@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"./>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge"./>
+    <title>SKDB</title>
+    <meta name="viewport" content="width=device-width"./>
+    <meta property="og:title" content="Getting started SKDB"./>
+    <meta property="og:type" content="website"./>
+    <meta property="og:url" content="./docs.html"./>
+    <meta property="og:description" content="SKDB docs"./>
+    <meta name="twitter:card" content="summary"./>
+    <link rel="shortcut icon" href="./img/favicon.png"./>
+    <link rel="stylesheet" href=".//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/styles/default.min.css"./>
+    <link rel="stylesheet" href="./css/main.css"./>
+  </head>
+  <body class="sideNavVisible doc">
+    <div class="fixedHeaderContainer">
+      <div class="headerWrapper wrapper">
+        <header>
+	  <a href="index.html">
+	    <div style="color:#B22222;border-style:solid;border-width:1px;padding-left:5px;padding-right:5px;border-radius:5px;">&#9673; SKDB</div>
+	    <h2 class="headerTitle">SKDB</h2>
+	  </a>
+	  <div class="navigationWrapper navigationSlider">
+	    <nav class="slidingNav">
+	      <ul class="nav-site nav-site-internal">
+		      <li class="">
+		        <a href="./docs.html" target="_self">Docs</a>
+		      </li>
+		      <li class="">
+		        <a href="./about.html" target="_self">About</a>
+		      </li>
+	      </ul>
+	    </nav>
+	  </div>
+	</header>
+    </div>
+    </div>
+    <div class="container mainContainer">
+      <div class="wrapper">
+        <div class="post">
+          <header class="postHeader">
+            <h1> </h1>
+          </header>
+          <article>
+<script>
+function setClipboard(text) {
+    var type = "text/plain";
+    var blob = new Blob([text], { type });
+    var data = [new ClipboardItem({ [type]: blob })];
+
+    navigator.clipboard.write(data).then(
+        function () {
+        /* success */
+        },
+        function () {
+        /* failure */
+        }
+    );
+}
+
+function CopyToClipboard(id) {
+    var r = document.createRange();
+    r.selectNode(document.getElementById(id));
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(r);
+    document.execCommand('copy');
+    var text = window.getSelection().toString();
+    var result = "";
+    var inCommand = false;
+    for(let i = 0; i < text.length; i++) {
+        var c = text.charAt(i);
+        if(inCommand) {
+            result = result + c;
+        }
+        if(c == '$') {
+            inCommand = true;
+        }
+        if(c == '\n') {
+            inCommand = false;
+        }
+    }
+    text = result;
+    window.getSelection().removeAllRanges();
+    setClipboard(text);
+}
+</script>
+

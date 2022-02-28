@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>SKDB &middot; The SQL database that tells you when your query results changed</title>
+  <meta name="viewport" content="width=device-width" />
+  <meta name="generator" content="Docusaurus" />
+  <meta property="og:title" content="SKDB ? The SQL database that tells you when your query results changed" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="./index.html" />
+  <meta property="og:description" content="The SQL database that tells you when your query results changed" />
+  <meta name="twitter:card" content="summary" />
+  <link rel="shortcut icon" href="img/favicon.png" />
+  <link rel="stylesheet" href="http://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/styles/default.min.css" />
+  <link rel="stylesheet" href="css/main.css" />
+</head>
+<body>
+  <div class="fixedHeaderContainer">
+    <div class="headerWrapper wrapper">
+      <header>
+        <a href="index.html">
+          <div
+            style="color:#B22222;border-style:solid;border-width:1px;padding-left:5px;padding-right:5px;border-radius:5px;">
+            &#9673; SKDB</div>
+          <h2 class="headerTitle">SKDB</h2>
+        </a>
+        <div class="navigationWrapper navigationSlider">
+          <nav class="slidingNav">
+            <ul class="nav-site nav-site-internal">
+              <li><a href="./docs.html" target="_self">Docs</a></li>
+              <li><a href="./about.html" target="_self">About</a></li>
+            </ul>
+          </nav>
+        </div>
+      </header>
+    </div>
+  </div>
+  <div class="navPusher">
+    <div class="home">
+      <div class="homeContainer">
+        <script src="redirect.js"></script>
+        <div class="homeSplashFade">
+          <div class="wrapper homeWrapper">
+            <div class="inner">
+              <h1 class="projectTitle">
+                SKDB
+                <small>The SQL database that tells you when your query results changed</small>
+              </h1>
+              <div class="section promoSection">
+                <div class="promoRow">
+                  <div class="pluginRowBlock">
+                    <div class="pluginWrapper buttonWrapper">
+                      <a class="button" href="./docs.html" target="_self">Download</a>
+                    </div>
+                    <div class="pluginWrapper buttonWrapper">
+                      <a class="button" href="./about.html" target="_self">Contact us</a>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="mainContainer">
+        <div class="container homeOverview">
+          <div class="wrapper">
+            <h2>Overview</h2>
+            <p>
+              SKDB is a general-purpose SQL database that lets you subscribe to changes to your
+              queries. Through a new construction called "virtual views", you can ask the database
+              to keep a particular view up-to-date at all times, to notify you when that
+              view has changed, or to produce a "diff" between now and any time in the past.
+            </p>
+
+            <h3>Streaming</h3>
+            <p>
+              SKDB can also process ephemeral streams of data which can be used to receive alerts
+              or to compute real-time analytics. Those ephemeral streams can then be mixed with SQL
+              tables through joins or other constructions.
+            </p>
+            <h3>Concurrent</h3>
+            <p>
+              SKDB is inspired by SQLite and supports the same subset of SQL
+              (including transactions). What sets it apart is that it is also highly concurrent.
+              SKDB supports processing complex queries from multiple simultaneous readers/writers
+              without stalling other database users.
+            </p>
+            <h3>Try it Out</h3>
+            <p>
+              While SKDB is still in early development, a free version is available for non-commercial
+              use on the <a href="./docs.html" target="_self">docs page</a>. If you're intrigued,
+              or feel like SKDB is exactly what you've been looking for, we'd love for you to
+              give it a try and share your thoughts.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <footer class="nav-footer" id="footer">
+        <section class="sitemap">
+          <div>
+            <h5>Legal</h5>
+            <a href="./privacy.pdf">Website privacy</a>
+            <a href="./terms.pdf">Terms of use</a>
+          </div>
+          <div>
+            <h5>Documentation</h5>
+            <a href="./docs.html">Docs</a>
+          </div>
+          <div>
+            <h5>About</h5>
+            <a href="./about.html">Contact us</a>
+        </div>
+        </section>
+        <section class="copyright">
+          Copyright &#169; 2022 SkipLabs Inc.
+        </section>
+    </footer>
+</body>
+</html>

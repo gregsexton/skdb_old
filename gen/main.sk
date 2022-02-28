@@ -1,0 +1,33 @@
+untracked fun main(): void {
+  lineNbr = 1;
+  inCode = false;
+  try {
+    loop {
+      str = read_line();
+      if (str.startsWith("```")) {
+        if (!str.startsWith("```$") && !inCode) {
+          print_error("Missing '$', line " + lineNbr);
+          exit(2);
+        };
+        if (!str.startsWith("```$ ") && !inCode) {
+          print_error("Missing space after $, line " + lineNbr);
+          exit(2);
+        };
+        if (!inCode) {
+          !str = str.stripPrefix("```");
+        } else {
+          !str = "";
+        };
+        !inCode = !inCode;
+      };
+      if (inCode) {
+        if (!str.startsWith("...")) {
+          print_string(str);
+        };
+      };
+      !lineNbr = lineNbr + 1;
+    }
+  } catch {
+  | _ -> void
+  }
+}

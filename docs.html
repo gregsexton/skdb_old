@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"./>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge"./>
+    <title>SKDB</title>
+    <meta name="viewport" content="width=device-width"./>
+    <meta property="og:title" content="Getting started SKDB"./>
+    <meta property="og:type" content="website"./>
+    <meta property="og:url" content="./docs.html"./>
+    <meta property="og:description" content="SKDB docs"./>
+    <meta name="twitter:card" content="summary"./>
+    <link rel="shortcut icon" href="./img/favicon.png"./>
+    <link rel="stylesheet" href=".//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/styles/default.min.css"./>
+    <link rel="stylesheet" href="./css/main.css"./>
+  </head>
+  <body class="sideNavVisible doc">
+    <div class="fixedHeaderContainer">
+      <div class="headerWrapper wrapper">
+        <header>
+	  <a href="index.html">
+	    <div style="color:#B22222;border-style:solid;border-width:1px;padding-left:5px;padding-right:5px;border-radius:5px;">&#9673; SKDB</div>
+	    <h2 class="headerTitle">SKDB</h2>
+	  </a>
+	  <div class="navigationWrapper navigationSlider">
+	    <nav class="slidingNav">
+	      <ul class="nav-site nav-site-internal">
+		      <li class="">
+		        <a href="./docs.html" target="_self">Docs</a>
+		      </li>
+		      <li class="">
+		        <a href="./about.html" target="_self">About</a>
+		      </li>
+	      </ul>
+	    </nav>
+	  </div>
+	</header>
+    </div>
+    </div>
+    <div class="container mainContainer">
+      <div class="wrapper">
+        <div class="post">
+          <header class="postHeader">
+            <h1> </h1>
+          </header>
+          <article>
+<script>
+function setClipboard(text) {
+    var type = "text/plain";
+    var blob = new Blob([text], { type });
+    var data = [new ClipboardItem({ [type]: blob })];
+
+    navigator.clipboard.write(data).then(
+        function () {
+        /* success */
+        },
+        function () {
+        /* failure */
+        }
+    );
+}
+
+function CopyToClipboard(id) {
+    var r = document.createRange();
+    r.selectNode(document.getElementById(id));
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(r);
+    document.execCommand('copy');
+    var text = window.getSelection().toString();
+    var result = "";
+    var inCommand = false;
+    for(let i = 0; i < text.length; i++) {
+        var c = text.charAt(i);
+        if(inCommand) {
+            result = result + c;
+        }
+        if(c == '$') {
+            inCommand = true;
+        }
+        if(c == '\n') {
+            inCommand = false;
+        }
+    }
+    text = result;
+    window.getSelection().removeAllRanges();
+    setClipboard(text);
+}
+</script>
+
+<h1> </h1>
+
+<h2>Download</h2>
+
+<p>A free version of skdb is available for non-commercial use (<a href="./license.pdf">license</a>).
+You can download it here:
+<a href="https://github.com/SkipLabs/skdb/raw/main/bin/skdb-linux-x64-0.9.bin">https://github.com/SkipLabs/skdb/raw/main/bin/skdb-linux-x64-0.9.bin</a></p>
+
+<p>For commercial use, please contact us at <a href="mailto:contact@skiplabs.io">contact@skiplabs.io</a>.</p>
+
+<h2>Linux</h2>
+
+<p>SKDB is only available for x64-Linux.
+If you don't have linux on your machine, you can install <a href="https://docs.docker.com/get-docker/">docker</a>.
+Although SKDB runs on most versions of Linux, SkipLabs will only maintain a version running on the latest <a href="https://wiki.ubuntu.com/Releases">ubuntu LTS</a>.
+We highly recommend you use that version,
+but if you need to run skdb on a different platform, please contact us at <a href="mailto:contact@skiplabs.io">contact@skiplabs.io</a>.</p>
+
+<h2>SQL</h2>
+
+<p>This documentation is not a good place to learn SQL. If you need to get started you can find a good introduction here: <a href="https://www.w3schools.com/sql/">https://www.w3schools.com/sql/</a>.
+The subset of SQL implemented by SKDB is the same as SQLite, you can find it here: <a href="https://www.sqlite.org/lang.html">https://www.sqlite.org/lang.html</a>. The API to access SKDB is command-line based for now. If you need a driver please contact us at: <a href="mailto:contact@skiplabs.io">contact@skiplabs.io</a>.</p>
+
+<h2>Install</h2>
+
+<p>First, install the binary file (preferably in '/usr/local/bin'). Make sure you don't rename the original binary, because
+some SKDB updates will require you to export your data to a newer version of the database. So it is safer to keep all
+the different versions of SKDB around in case you need them.</p>
+
+<p><pre><code id="code119" class="hljs">$ wget https://github.com/SkipLabs/skdb/raw/main/bin/skdb-linux-x64-0.9.bin
+$ chmod 755 skdb-linux-x64-0.9.bin
+$ sudo mv skdb-linux-x64-0.9.bin /usr/local/bin
+$ sudo ln -s /usr/local/bin/skdb-linux-x64-0.9.bin /usr/local/bin/skdb
+</code><button style="float: right;" onclick="CopyToClipboard('code119');return false;">Copy</button><div>  </div></pre></p>
+
+<h2>Initialization</h2>
+
+<p>SKDB stores all of its data in a file specified by the user.
+To initialize a database file, use the option '--init':</p>
+
+<p><pre><code id="code130" class="hljs">$ skdb --init /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code130');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Make sure you do not manipulate this file (copy, rename, etc.) while other processes are accessing the database.
+By default the maximum capacity of the database is 16GB: once that capacity is reached the database will
+become read-only. If you need a larger capacity, you can use the option '--capacity' at initialization time.</p>
+
+<p><pre><code id="code137" class="hljs">$ skdb --init /tmp/test.db --capacity $YOUR_CHOICE_IN_BYTES
+</code><button style="float: right;" onclick="CopyToClipboard('code137');return false;">Copy</button><div>  </div></pre></p>
+
+<h2>Loading data</h2>
+
+<p>Let's first load some mock data to play with the database.</p>
+
+<p><pre><code id="code144" class="hljs">$ wget https://github.com/SkipLabs/skdb/raw/main/example/tiny_TPCH.sql
+$ cat tiny_TPCH.sql | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code144');return false;">Copy</button><div>  </div></pre></p>
+
+<p>This created two tables. One named customer the other named orders.
+Here are their schemas:</p>
+
+<p><pre><code id="code151" class="hljs">$ skdb --dump-tables --data /tmp/test.db
+CREATE TABLE customer (
+  c_custkey INTEGER PRIMARY KEY,
+  c_name TEXT,
+  c_address TEXT,
+  c_nationkey INTEGER,
+  c_phone TEXT,
+  c_acctbal FLOAT,
+  c_mktsegment TEXT,
+  c_comment TEXT
+);
+CREATE TABLE orders (
+  o_orderkey INTEGER PRIMARY KEY,
+  o_custkey INTEGER,
+  o_orderstatus TEXT,
+  o_totalprice FLOAT,
+  o_orderdate TEXT,
+  o_orderpriority TEXT,
+  o_clerk TEXT,
+  o_shippriority INTEGER,
+  o_comment TEXT
+);
+</code><button style="float: right;" onclick="CopyToClipboard('code151');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Note that SKDB only supports 3 types:
+64 bits integers (INTEGER),
+64 bits floating point numbers (FLOAT)
+and UTF-8 strings (TEXT).</p>
+
+<p>By looking at the schema, we can see that the two tables are related through the columns 'c_custkey' and 'o_custkey'.
+Each order identifies the customer that passed the order through a unique identifier (as it is often the case in
+relational databases).</p>
+
+<h2>Virtual views</h2>
+
+<p>At the core of SKDB, are virtual views.
+Let's take an example:</p>
+
+<p><pre><code id="code189" class="hljs">$ echo "create virtual view positive_bal_customers as select * from customer where c_acctbal &gt; 0.0;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code189');return false;">Copy</button><div>  </div></pre></p>
+
+<p>In this example, we created a virtual view called 'positive_bal_customers' that regroups all the customers with a positive balance.
+Virtual views are always maintained up-to-date by the database, so running a query on them is very fast.
+For example:</p>
+
+<p><pre><code id="code196" class="hljs">$ echo "select c_nationkey, avg(c_acctbal) from positive_bal_customers group by c_nationkey;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code196');return false;">Copy</button><div>  </div></pre></p>
+
+<p>That query would have run at the exact same speed had we created a separate table containing all the customers with a positive balance.
+But what happens when a query involves multiple tables? This requires the use of a join, which you will see, works a bit differently in SKDB.</p>
+
+<h2>Joins</h2>
+
+<p>Let's try to run a basic join:</p>
+
+<p><pre><code id="code206" class="hljs">$ echo "select * from customer, orders where c_custkey = o_custkey;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code206');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Surprisingly, this leads to an error (the error can be ignored with the option '--always-allow-joins'):</p>
+
+<p><pre><code id="code211" class="hljs">$ echo "select * from customer, orders where c_custkey = o_custkey;" | skdb --data /tmp/test.db
+select * from customer, orders where c_custkey = o_custkey;
+^
+|
+ ----- ERROR
+Error: line 1, characters 0-0:
+Joins outside of virtual views are considered bad practice in skdb.
+You should first create a virtual view joining customer and orders with a query of the form:
+create virtual view customer_orders as select * from customer, orders where c_custkey = o_custkey;
+And then use customer_orders directly.
+PS: You can ignore this error message with --always-allow-joins (not recommended).
+PS2: don't forget you can add indexes to virtual views.
+</code><button style="float: right;" onclick="CopyToClipboard('code211');return false;">Copy</button><div>  </div></pre></p>
+
+<p>The error message is pretty explicit. Joins outside of a virtual view are considered bad practice. But why is that?
+The reason is that a join is an expensive operation. When you run it outside of a virtual view, you will have
+to repeat that operation every single time the query is run.
+A better approach is to create a virtual view once and for all and have all the subsequent queries
+share the same virtual view. Let's follow the advice given in the error message:</p>
+
+<p><pre><code id="code231" class="hljs">$ echo "create virtual view customer_orders as select * from customer, orders where c_custkey = o_custkey;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code231');return false;">Copy</button><div>  </div></pre></p>
+
+<p>This command created the virtual view 'customer_orders', which can now be used like any other table.
+The difference between a virtual view and a normal view is that the database will maintain that view up-to-date
+at all times. In this case that means that any change in the customer or order table will be reflected in the virtual view 'customer_orders'.
+This also implies that reading from a virtual view is very fast, because the data is already there.
+Let's find the orders from customer number 889:</p>
+
+<p><pre><code id="code240" class="hljs">$ echo "select * from customer_orders where c_custkey = 889;" | skdb --data /tmp/test.db
+889|Customer#000000889|pLvfd7drswfAcH8oh2seEct|13|23-625-369-6714|3635.3499999989999|FURNITURE|inal ideas. slowly pending frays are. fluff|931|889|F|155527.98000000001|1992-12-07|1-URGENT|Clerk#000000881|0|ss packages haggle furiously express, regular deposits. even, e
+</code><button style="float: right;" onclick="CopyToClipboard('code240');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And that works for any query involving customers and orders. Instead of recomputing expensive joins every single time orders and customers are
+involved, you can run those queries directly on the virtual view 'customer_orders'.
+To speed things up, we recommend you add indexes to your virtual views:</p>
+
+<p><pre><code id="code248" class="hljs">$ echo "create index customer_orders_c_custkey ON customer_orders(c_custkey);" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code248');return false;">Copy</button><div>  </div></pre></p>
+
+<p>If you are unsure about your queries, you can ask SKDB to list the indexes that were used for a particular query through the option '--show-used-indexes'.
+This option is particularly useful when trying to optimize your queries.</p>
+
+<p><pre><code id="code254" class="hljs">$ echo "select * from customer_orders where c_custkey = 889;" | skdb --data /tmp/test.db --show-used-indexes
+USING INDEX: customer_orders_c_custkey
+...
+</code><button style="float: right;" onclick="CopyToClipboard('code254');return false;">Copy</button><div>  </div></pre></p>
+
+<h2>Connections</h2>
+
+<p>Virtual views can be used to maintain an up-to-date query at all times, as we have just seen, but
+they can also be used to be notified when changes occur.</p>
+
+<p>For example, let's create a query that tracks all the customer with a negative balance:</p>
+
+<p><pre><code id="code266" class="hljs">$ echo "create virtual view negative_balance as select * from customer where c_acctbal &lt; 0.0;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code266');return false;">Copy</button><div>  </div></pre></p>
+
+<p>The creation of the virtual view does not trigger notifications. We need to "connect" to that view in order to receive them:</p>
+
+<p><pre><code id="code271" class="hljs">$ skdb --data /tmp/test.db --connect negative_balance --updates /tmp/negative_balance
+6050
+</code><button style="float: right;" onclick="CopyToClipboard('code271');return false;">Copy</button><div>  </div></pre></p>
+
+<p>With this command we instructed SKDB to send all the changes relative to the virtual view 'negative_balance' to the file '/tmp/negative_balance'.
+In return, SKDB gave us the session number "6050", which will be useful to retrieve the status of that connection.</p>
+
+<p>Let's have a look at the file:</p>
+
+<p><pre><code id="code280" class="hljs">$ tail /tmp/negative_balance
+1       875|Customer#000000875|8pQ4YUYox0d|3|13-146-810-5423|-949.27999999899998|FURNITURE|ar theodolites snooze slyly. furiously express packages cajole blithely around the carefully r
+1       880|Customer#000000880|ogwHmUUFa1QB69pAoYAAoB0rjbdsVpAQ552e5Q,|8|18-763-990-8618|-77.629999999000006|FURNITURE|regular requests. regular deposits ar
+1       885|Customer#000000885|nNUbC73nPBCKLg0|5|15-874-471-4903|-959.94000000000005|HOUSEHOLD|sits impress regular deposits. slyly silent excuses grow
+...
+</code><button style="float: right;" onclick="CopyToClipboard('code280');return false;">Copy</button><div>  </div></pre></p>
+
+<p>The format is pretty straight forward. It's a key/value format, separated by a tab, where the key is the number of repetitions of a row and the value contains all the columns separated by a '|' (you can switch to csv with the option --csv).
+That number corresponds to the total number of rows with that value. So if a row was already present 23 times, and a transaction adds an additional instance of that row, that number would become 24.
+However, in practice, the number of repetition is often going to be 0 or 1 (0 for removal).
+Also note that for ephemeral streams (which will be introduced later), that number is always 1.</p>
+
+<p>You can check the status of every connection at all times with the option '--sessions':</p>
+
+<p><pre><code id="code294" class="hljs">$ skdb --sessions --data /tmp/test.db
+6050    /negative_balance/      CONNECTED
+</code><button style="float: right;" onclick="CopyToClipboard('code294');return false;">Copy</button><div>  </div></pre></p>
+
+<p>We can see that our connection is live. You can decide to disconnect a sessions with the option '--disconnect', but note that sessions will automatically disconnect in case of a problem.
+The option '--reconnect', restarts the session where it started to fail and sends all the data that was missed since the disconnection.</p>
+
+<p>Let's see what happens when the data changes:</p>
+
+<p><pre><code id="code303" class="hljs">$ echo "delete from customer where c_custkey = 11;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code303');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And see the effect in '/tmp/negative_balance':</p>
+
+<p><pre><code id="code308" class="hljs">$ tail /tmp/negative_balance
+...
+&lt;-------- EMPTY LINE
+&lt;-------- EMPTY LINE
+ 0     11|Customer#000000011|PkWS 3HlXqwTuzrKg633BEi|23|33-464-151-3439|-272.60000000000002|BUILDING|ckages. requests sleep slyly. quickly even pinto beans promise above the slyly regular pinto beans.
+</code><button style="float: right;" onclick="CopyToClipboard('code308');return false;">Copy</button><div>  </div></pre></p>
+
+<p>A new line appeared notifying us that the customer 11 has been removed.
+You may have noticed that two empty lines were introduced before the notification:
+those lines tell us that the database finished a transaction and is starting a new one. If you are ingesting the changes, you
+can safely assume that the database was in a consistent state at that point.</p>
+
+<h2>Diffing</h2>
+
+<p>Waiting for changes is fine, but the problem is that the changes are "pushed" to the user.
+Sometimes, we will need to operate the other way around: the user will want to "pull" changes,
+by asking periodically what has changed since the last time around.</p>
+
+<p>Fortunately, SKDB has the solution: the '--diff' option.
+Let's create a new connection, this time without the associated '--updates' option:</p>
+
+<p><pre><code id="code329" class="hljs">$ skdb --data /tmp/test.db --connect negative_balance
+6065
+</code><button style="float: right;" onclick="CopyToClipboard('code329');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And use the session number to get a "diff":</p>
+
+<p><pre><code id="code335" class="hljs">$ skdb --diff 6065 --since 0 --data /tmp/test.db
+Time: 26
+0       11|Customer#000000011|PkWS 3HlXqwTuzrKg633BEi|23|33-464-151-3439|-272.60000000000002|BUILDING|ckages. requests sleep slyly. quickly even pinto beans promise above the slyly regular pinto beans.
+1       33|Customer#000000033|qFSlMuLucBmx9xnn5ib2csWUweg D|17|27-375-391-1280|-78.560000000000002|AUTOMOBILE|s. slyly regular accounts are furiously. carefully pending requests
+1       37|Customer#000000037|7EV4Pwh,3SboctTWt|8|18-385-235-7162|-917.75|FURNITURE|ilent packages are carefully among the deposits. furiousl
+...
+</code><button style="float: right;" onclick="CopyToClipboard('code335');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Note that we used '--diff' in conjuction with '--since'. The '--since' option takes a timestamp produced by the database.
+The timestamp 0 corresponds to the beginning of times. So asking for a diff since time 0 will get you all the data associated
+with a session.
+The first line above contains a timestamp ('Time: 26') that will be a useful diff
+point for us shortly.</p>
+
+<p>Let's now make some modifications:</p>
+
+<p><pre><code id="code351" class="hljs">$ echo "delete from customer where c_custkey = 33;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code351');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And ask for the diff since the timestamp from above (26):</p>
+
+<p><pre><code id="code356" class="hljs">$ skdb --diff 6065 --since 26 --data /tmp/test.db
+Time: 29
+0       33|Customer#000000033|qFSlMuLucBmx9xnn5ib2csWUweg D|17|27-375-391-1280|-78.560000000000002|AUTOMOBILE|s. slyly regular accounts are furiously. carefully pending requests
+</code><button style="float: right;" onclick="CopyToClipboard('code356');return false;">Copy</button><div>  </div></pre></p>
+
+<p>The output gives us the next timestamp (25) plus the diff (the removal of the user 33).
+You can repeat that operation as often as you want, at the rate you want, which makes
+it convenient to pull changes periodically.</p>
+
+<h2>--updates vs --diff</h2>
+
+<p>So when should you use '--updates' and when should you use a '--diff'?
+You should use '--updates' if you need your changes to be live, and when you are confident that
+the process that handles the changes will be able to keep up with the write rate of the database.</p>
+
+<h2>Streaming</h2>
+
+<p>SKDB also supports ephemeral tables called streams. They work exactly like a normal
+SQL table, except that they do not persist on disk:</p>
+
+<p><pre><code id="code376" class="hljs">$ echo "create stream customer_connect_log (clog_custkey INTEGER, clog_time INTEGER);" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code376');return false;">Copy</button><div>  </div></pre></p>
+
+<p>We just declared an ephemeral data stream called 'customer_connect_log'.
+We can now use that table to log every time a customer connects to the system.
+The difference with a "normal" table, is that the data is ephemeral (it will not persist on disk).
+So what's the point of a stream you may ask? It comes in handy when trying to receive alerts.
+For example, imagine we wanted to receive and alert every time a customer with a negative balance connected to our system.</p>
+
+<p>Step 1, we join the log with the table of customers (it's better to keep that as a separate step,
+to be able to reuse the view 'customer_log'):</p>
+
+<p><pre><code id="code388" class="hljs">$ echo "create virtual view customer_log as select * from customer_connect_log, customer where c_custkey = clog_custkey;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code388');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Step 2, we create a virtual view tracking connection of users with a negative balance:</p>
+
+<p><pre><code id="code393" class="hljs">$ echo "create virtual view negative_bal_connection as select * from customer_log where c_acctbal &lt; 0.0;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code393');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Finally, we connect to that view:</p>
+
+<p><pre><code id="code398" class="hljs">$ skdb --connect negative_bal_connection --updates /tmp/negative_bal_connection --data /tmp/test.db
+7090
+</code><button style="float: right;" onclick="CopyToClipboard('code398');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Let's see what happens when we add data to the stream (using '--load-csv' is faster than 'INSERT' statements when
+manipulating streams):</p>
+
+<p><pre><code id="code405" class="hljs">$ for i in {1..10000}; do echo "$i, $i"; done | skdb --data /tmp/test.db --load-csv customer_connect_log
+</code><button style="float: right;" onclick="CopyToClipboard('code405');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And check the result in '/tmp/negative_bal_connection':</p>
+
+<p><pre><code id="code410" class="hljs">$ tail -f /tmp/negative_bal_connection
+1       995|995|995|Customer#000000995|5tCSAsm4qL5OvHdRZsiwSlVTdqPZws3f|13|23-272-700-1002|-341.79000000000002|BUILDING|wake slyly fluffily unusual requests. stealthily regular pinto beans are along the slyly final dugouts. slyly 
+...
+</code><button style="float: right;" onclick="CopyToClipboard('code410');return false;">Copy</button><div>  </div></pre></p>
+
+<p>As expected, we got notified every time a customer with a negative balance connected.
+To make the performance more predictable, SKDB will never spawn threads or fork processes behind your back. However, you should feel free to use multiple processes to speedup the ingestion of
+data, including when targetting the same stream (Because SKDB supports multiple writers/readers).
+In this case, we could for example get 10 processes writing on the stream 'customer_connect_log' at the same time:</p>
+
+<p><pre><code id="code420" class="hljs">$ for j in {1..10}; do (for i in {1..10000}; do echo "$i, $i"; done | skdb --data /tmp/test.db --load-csv customer_connect_log)&amp; done; wait
+</code><button style="float: right;" onclick="CopyToClipboard('code420');return false;">Copy</button><div>  </div></pre></p>
+
+<p>If you replace the '&amp;' with a ';', you will see a dramatic slow down in the ingestion rate of
+the data.</p>
+
+<p>On a laptop with more than 10 cores, the sequential time is 1.0s, while only 0.2s when
+using 10 processes (so roughly 5X faster).</p>
+
+<h2>Real-time analytics.</h2>
+
+<p>As mentioned earlier, streams are ephemeral. So what happens when using aggregate functions on them?</p>
+
+<p><pre><code id="code433" class="hljs">$ echo "select count(*) from customer_connect_log;" | skdb --data /tmp/test.db
+^
+|
+ ----- ERROR
+Error: line 1, characters 0-0:
+Cannot use a stream for aggregates, use a window instead
+</code><button style="float: right;" onclick="CopyToClipboard('code433');return false;">Copy</button><div>  </div></pre></p>
+
+<p>We get an error. The error invites us to use a "window". A window is exactly like a stream, except that
+it will persist data for a certain time. It's the kind of table you will need to compute real-time analytics.
+For example, let's say we want to keep the data received in the last hour.</p>
+
+<p><pre><code id="code445" class="hljs">$ echo "create window 3600 customer_connect_window (cw_time INTEGER, cw_custkey INTEGER);" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code445');return false;">Copy</button><div>  </div></pre></p>
+
+<p>The first column of a window is always expected to be a timestamp (an integer corresponding to a number of seconds since a fixed time in the past).
+The number 3600 corresponds to the number of seconds we want to persist the data.</p>
+
+<p>Now that we successfully created a window, let's run a query on it. Let's compute the average
+account balance of the customers who connected in the last hour.
+As usual, we first compute the join as a separate step:</p>
+
+<p><pre><code id="code455" class="hljs">$ echo "create virtual view customer_window as select * from customer_connect_window, customer where cw_custkey = c_custkey;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code455');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And then produce the average based on that virtual view:</p>
+
+<p><pre><code id="code460" class="hljs">$ echo "create virtual view avg_balance as select avg(c_acctbal) from customer_window;" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code460');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Now let's connect to that view:</p>
+
+<p><pre><code id="code465" class="hljs">$ skdb --connect avg_balance --updates /tmp/avg_balance --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code465');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And add some data:</p>
+
+<p><pre><code id="code470" class="hljs">$ for i in {1..500}; do echo "$i, $i"; done | skdb --data /tmp/test.db --load-csv customer_connect_window
+</code><button style="float: right;" onclick="CopyToClipboard('code470');return false;">Copy</button><div>  </div></pre></p>
+
+<p>And look at the file of updates:</p>
+
+<p><pre><code id="code475" class="hljs">$ tail /tmp/avg_balance
+...
+1       711.55999999899996
+&lt;--- NEWLINE
+&lt;--- NEWLINE
+1       4531.63158634502
+</code><button style="float: right;" onclick="CopyToClipboard('code475');return false;">Copy</button><div>  </div></pre></p>
+
+<p>So you may wonder, how often is '/tmp/avg_balance' updated? On every single change?
+Windows are different from streams and normal SQL tables in that regard.
+When using a window, the database can decide to regroup changes together.
+So in this case, there might have been intermediate values between 711.5 and 4531.6 that were
+never sent to the stream of changes.
+The reason is that most of the time, we don't care how many elements are exactly present in given windows. So regrouping insertions makes sense (and speeds things up).
+If you are unhappy with that behavior, and you want notifications for every single window insert to be triggered, you can pass the option '--force-window-update',
+which will make windows work like streams (or normal sql tables) in that regard.</p>
+
+<p>Let's try it:</p>
+
+<p><pre><code id="code494" class="hljs">$ for i in {500..1000}; do echo "$i, $i"; done | skdb --data /tmp/test.db --load-csv customer_connect_window --force-window-update
+</code><button style="float: right;" onclick="CopyToClipboard('code494');return false;">Copy</button><div>  </div></pre></p>
+
+<p>If you look at the file '/tmp/avg_balance' you can see that all the updates are there.</p>
+
+<p><pre><code id="code499" class="hljs">$ wc /tmp/avg_balance
+ 1509  1005 11507 /tmp/avg_balance
+</code><button style="float: right;" onclick="CopyToClipboard('code499');return false;">Copy</button><div>  </div></pre></p>
+
+<h2>Time and ID</h2>
+
+<p>Sometimes, you will want the database to generate a timestamp for you.
+When that's the case, you can use the "time" function.</p>
+
+<p><pre><code id="code508" class="hljs">$ echo "insert into customer_connect_window values(time(), 34);" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code508');return false;">Copy</button><div>  </div></pre></p>
+
+<p>Similarly, we can generate primary keys by using the function "id".</p>
+
+<p><pre><code id="code513" class="hljs">$ echo "insert into orders values (id(), 568, 'F', 133466.829999999, '1992-01-04', '5-LOW', 'Clerk#000000339', 0, '');" | skdb --data /tmp/test.db
+</code><button style="float: right;" onclick="CopyToClipboard('code513');return false;">Copy</button><div>  </div></pre></p>
+
+<p>If you need to use an id in multiple places (in a transaction for example), you can name them.
+So for example you could use multiple instances of id('a'), they would all be referring to the same id within the same transaction.</p>
+
+<h2>Streams vs Windows</h2>
+
+<p>You should always prefer streams to windows: they are faster and require less memory.
+So only use windows when you have to use an aggregate function, typically for analytics.</p>
+
+<h2>Bug report</h2>
+
+<p>Feel free to file github issues here: <a href="https://github.com/SkipLabs/skdb">https://github.com/SkipLabs/skdb</a></p>
+
+<h2>Thank you for reading!</h2>
+
+          </article>
+            </div>
+      </div>
+      </div>
+      </div>
+<footer class="nav-footer" id="footer">
+        <section class="sitemap">
+          <div>
+            <h5>Legal</h5>
+            <a href="./privacy.pdf">Website privacy</a>
+            <a href="./terms.pdf">Terms of use</a>
+          </div>
+          <div>
+            <h5>Documentation</h5>
+            <a href="./docs.html">Docs</a>
+          </div>
+          <div>
+            <h5>About</h5>
+            <a href="./about.html">Contact us</a>
+        </div>
+        </section>
+  <section class="copyright">
+    Copyright &#169; 2022 SkipLabs Inc.
+  </section>
+</footer>
+</div>
+</body>
+</html>
