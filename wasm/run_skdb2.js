@@ -242,6 +242,17 @@ function wasmStringToJS(instance, wasmPointer) {
 }
 
 /* ***************************************************************************/
+/* A few primitives to encode/decode JSON. */
+/* ***************************************************************************/
+
+function stringify(obj) {
+  if(obj === undefined) {
+    obj = null;
+  }
+  return JSON.stringify(obj);
+}
+
+/* ***************************************************************************/
 /* The function that creates the database. */
 /* ***************************************************************************/
 
@@ -253,6 +264,13 @@ async function makeSKDB(reboot) {
   var current_stdin = 0;
   var stdin = '';
   var stdout = new Array();
+  var onRootChange = new Array();
+  var initJSRoots = null;
+  var addRoot = null;
+  var removeRoot = null;
+  var trackedCall = null;
+  var trackedQuery = null;
+  var externalFuns = [];
   var skipMain = null;
   var fileDescrs = new Array();
   var fileDescrNbr = 2;
@@ -263,6 +281,7 @@ async function makeSKDB(reboot) {
   var lineBuffer = [];
   var storeName = "SKDBStore";
   var initPages = 0;
+  var roots = null;
 
   const env = {
     memoryBase: 0,
@@ -278,6 +297,9 @@ async function makeSKDB(reboot) {
     __cxa_throw: function(ptr, type, destructor) {
       throw ptr;
     },
+    SKIP_print_backtrace: function () {
+      console.trace('');
+    },
     SKIP_etry: function(f, exn_handler) {
       try {
         return SKIP_call0(f);
@@ -292,6 +314,14 @@ async function makeSKDB(reboot) {
       process.stdout.write(String.fromCharCode(c));
     },
     printf: function(ptr) {
+    },
+    SKIP_call_external_fun: function(funId, str) {
+      return encodeUTF8(
+        instance,
+        stringify(
+          externalFuns[funId](JSON.parse(wasmStringToJS(instance, str)))
+        )
+      );
     },
     SKIP_print_error: function(str) {
       process.stderr.write(wasmStringToJS(instance, str));
@@ -388,6 +418,19 @@ async function makeSKDB(reboot) {
         storePages();
       };
     }
+  };
+
+  runAddRoot = function(rootName, funId, arg) {
+    args = [];
+    stdin = "";
+    stdout = new Array();
+    current_stdin = 0;
+    addRoot(
+      encodeUTF8(instance, rootName),
+      funId,
+      encodeUTF8(instance, stringify(arg))
+    );
+    return stdout.join('');
   }
 
   runLocal = function(new_args, new_stdin) {
@@ -417,11 +460,39 @@ async function makeSKDB(reboot) {
 
     storePages();
     return stdout.join('');
+  };
+
+  runSubscribeRoots = function() {
+    roots = new Map();
+    execOnChange[fileDescrNbr] = text => {
+      let changed = new Map();
+      let updates = text.split('\n')
+          .filter(x => x.indexOf('\t') != -1);
+      for(const update of updates) {
+        if(update.substring(0, 1) !== "0") continue;
+        let json = JSON.parse(update.substring(update.indexOf('\t')+1));
+        roots.delete(json.name);
+        changed.set(json.name, true);
+      }
+      for(const update of updates) {
+        if(update.substring(0, 1) === "0") continue;
+        let json = JSON.parse(update.substring(update.indexOf('\t')+1));
+        roots.set(json.name, json.value);
+        changed.set(json.name, true);
+      }
+      for(const f of onRootChange) {
+        for(const name of changed.keys()) {
+          f(name);
+        }
+      }
+    }
+    count++;
+    let fileName = "/subscriptions/jsroots";
+    runLocal(['--json', '--subscribe', 'jsroots', '--updates', fileName], "");
   }
 
   var mod = await fetch("out32.wasm");
   var source = await mod.arrayBuffer();
-  var typedArray = new Uint8Array(source);
   var typedArray = new Uint8Array(source);
 
   var mirroredTables = new Array();
@@ -469,6 +540,50 @@ async function makeSKDB(reboot) {
         return runLocal(new_args, new_stdin);
       },
 
+      registerFun: function(f) {
+        let funId = externalFuns.length;
+        externalFuns.push(f);
+        return funId;
+      },
+
+      trackedCall: function(funId, arg) {
+        let result = trackedCall(funId, encodeUTF8(instance, stringify(arg)));
+        return JSON.parse(wasmStringToJS(instance, result));
+      },
+
+      trackedQuery: function(arg, start, end) {
+        if(start === undefined) start = 0;
+        if(end === undefined) end = -1;
+        let result = trackedQuery(encodeUTF8(instance, arg), start, end);
+        return wasmStringToJS(instance, result).split('\n')
+          .filter(x => x != "")
+          .map(x => JSON.parse(x));
+      },
+
+      onRootChange: function(f) {
+        onRootChange.push(f);
+      },
+
+      addRoot: function(rootName, f, arg) {
+        if(roots === null) {
+          initJSRoots();
+          runSubscribeRoots();
+        }
+        runAddRoot(rootName, f, arg);
+      },
+
+      removeRoot: function(rootName) {
+        removeRoot(encodeUTF8(instance, rootName));
+      },
+
+      getRoot: function(rootName) {
+        return roots.get(rootName);
+      },
+
+      getPersistentSize: function() {
+        return getPersistentSize();
+      },
+
       subscribe: function(viewName, f) {
         execOnChange[fileDescrNbr] = f;
         let fileName = "/subscriptions/sub" + count;
@@ -498,10 +613,7 @@ async function makeSKDB(reboot) {
           return x;
         });
         let stdin = "insert into " + tableName + " values (" + values.join(", ") + ");";
-        return runLocal(['--json'], stdin)
-          .split("\n")
-          .filter(x => x != "")
-          .map(x => JSON.parse(x));
+        runLocal([], stdin);
       },
 
       getID: function() {
@@ -618,6 +730,11 @@ async function makeSKDB(reboot) {
   popDirtyPage = result.instance.exports.sk_pop_dirty_page;
   getPersistentSize = result.instance.exports.SKIP_get_persistent_size;
   skipMain = result.instance.exports.skip_main;
+  initJSRoots = result.instance.exports.SKIP_init_jsroots;
+  addRoot = result.instance.exports.SKIP_add_root;
+  removeRoot = result.instance.exports.SKIP_remove_root;
+  trackedCall = result.instance.exports.SKIP_tracked_call;
+  trackedQuery = result.instance.exports.SKIP_tracked_query;
   initPages = result.instance.exports.SKIP_get_persistent_size() / pageSize + 1;
   version = result.instance.exports.SKIP_get_version();
   db = await makeSKDBStore("SKDBIndexedDB", storeName, version, instance.exports.memory.buffer, getPersistentSize(), reboot);
@@ -627,7 +744,50 @@ async function makeSKDB(reboot) {
 
 async function initDB() {
   skdb = await makeSKDB(true);
-  skdb.client.sql('create table tracks (track_id INTEGER primary key, track_name STRING, duration_ms INTEGER, track_number INTEGER, album_id INTEGER, album_name STRING);');
+  skdb.client.sql('create table t1 (a INTEGER);');
+  let sizeCount = 20;
+
+  for(var i = 0; i < sizeCount; i++) {
+    skdb.client.insert('t1', [i]);
+  }
+
+  var sumLessThan = skdb.client.registerFun(i => {
+    let result = skdb.client.trackedQuery(`select sum(a) as count from t1 where a < ${i};`);
+    return result[0].count;
+  });
+
+  var first10 = skdb.client.registerFun(_ => {
+    return skdb.client.trackedQuery(`select * from t1;`);
+  });
+
+  skdb.client.addRoot("first10", first10, null);
+  console.log(skdb.client.getRoot("first10"));
+
+  var buildRoot = skdb.client.registerFun(i => {
+    return {rootNbr: i, rootCount: skdb.client.trackedCall(sumLessThan, i) };
+  });
+
+  for(var i = 0; i < sizeCount; i++) {
+    skdb.client.addRoot(`root${i}`, buildRoot, i);
+  }
+
+  for(var i = 0; i < sizeCount; i++) {
+    console.log('Root value: ' + skdb.client.getRoot(`root${i}`));
+  }
+
+  skdb.client.onRootChange(x => console.log(`Root ${x} changed: ${skdb.client.getRoot(x)}`));
+
+  for(var i = 0; i < sizeCount; i++) {
+    skdb.client.cmd(['--backtrace'], `delete from t1 where a = ${i};`);
+  }
+
+  for(var i = 0; i < sizeCount; i++) {
+    console.log('Root value: ' + skdb.client.getRoot(`root${i}`));
+  }
+
+//  skdb.client.insert('t1', [2]);
+//  console.log(skdb.client.getRoot('root2'));
+//  console.log('done');
 }
 
 async function testDB() {
@@ -643,5 +803,5 @@ async function testDB() {
   console.log(skdb.client.sql('select count(*) from tracks;')[0]);
 }
 
-// initDB();
-testDB();
+ initDB();
+//testDB();
