@@ -3,3 +3,5 @@ docs/commands.sh
 docs/commands.txt
 docs/commands_expected
 docs/commands_result
+wasm/build/
+
