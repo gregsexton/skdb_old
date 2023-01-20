@@ -26,19 +26,43 @@ interface WasmExports {
   memory: Memory;
 }
 
-let output = function (str) {
-  // @ts-expect-error
-  process.stdout.write(str);
-};
-
-let error = function (str) {
-  // @ts-expect-error
-  process.stderr.write(str);
-};
-
 /* ***************************************************************************/
 /* Primitives to connect to indexedDB. */
 /* ***************************************************************************/
+
+function clearSKDBStore(
+  dbName: string,
+  storeName: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let open = indexedDB.open(dbName, 1);
+
+    open.onupgradeneeded = function () {
+      let db = open.result;
+      let store = db.createObjectStore(storeName, { keyPath: "pageid" });
+    };
+
+    open.onsuccess = function () {
+      let db = open.result;
+      let tx = db.transaction(storeName, "readwrite");
+      let store = tx.objectStore(storeName);
+
+      store.clear();
+
+      tx.oncomplete = function () {
+        resolve();
+      };
+
+      tx.onerror = function (err) {
+        reject(err);
+      };
+    };
+
+    open.onerror = function (err) {
+      reject(err);
+    };
+  });
+}
 
 function makeSKDBStore(
   dbName: string,
@@ -67,16 +91,6 @@ function makeSKDBStore(
       let store = tx.objectStore(storeName);
 
       if (init) {
-        // First, let's empty the store.
-        store.getAllKeys().onsuccess = (event) => {
-          let pageidx;
-          // @ts-expect-error
-          for (pageidx = 0; pageidx < event.target.result.length; pageidx++) {
-            // @ts-expect-error
-            store.delete(event.target.result[pageidx]);
-          }
-        };
-
         let i;
         let cursor = 0;
         for (i = 0; i < memorySize / pageSize; i++) {
@@ -86,17 +100,24 @@ function makeSKDBStore(
         }
       } else {
         store.getAll().onsuccess = (event) => {
-          let pageidx;
-          // @ts-expect-error
-          for (pageidx = 0; pageidx < event.target.result.length; pageidx++) {
-            // @ts-expect-error
-            let page = event.target.result[pageidx];
+          let target = event.target;
+          if(target == null) {
+            reject(new Error("Unexpected null target"));
+            return;
+          }
+          let pages =
+              (
+                target as unknown as
+                { result: Array<{pageid: number, content: ArrayBuffer}>}
+              ).result;
+          for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+            let page = pages[pageIdx];
             const pageid = page.pageid;
             if (pageid < 0) continue;
-            page = new Uint32Array(page.content);
+            let pageBuffer = new Uint32Array(page.content);
             const start = pageid * (pageSize / 4);
-            for (let i = 0; i < page.length; i++) {
-              memory32[start + i] = page[i];
+            for (let i = 0; i < pageBuffer.length; i++) {
+              memory32[start + i] = pageBuffer[i];
             }
           }
         };
@@ -121,54 +142,84 @@ function makeSKDBStore(
 /* Primitives to connect to websockets. */
 /* ***************************************************************************/
 
+// protocol schema
+
+type ProtoQuery = {
+  request: "query";
+  query: string;
+  format?: "json";
+}
+
+type ProtoTail = {
+  request: "tail";
+  table: string;
+  user: string;
+  password: string;
+}
+
+type ProtoDumpTable = {
+  request: "dumpTable";
+  table: string;
+  suffix: string;
+}
+
+type ProtoWrite = {
+  request: "write";
+  table: string;
+  user: string;
+  password: string;
+}
+
+// control plane
+type ProtoRequest = ProtoQuery | ProtoTail | ProtoDumpTable | ProtoWrite;
+
+// data plane
+type ProtoData = {
+  request: "pipe";
+  data: string;
+}
+
+type ProtoMessage = ProtoRequest | ProtoData;
+
 function makeWebSocket(
   uri: string,
   onopen: () => void,
-  onmessage: (msg: string | ArrayBuffer | null) => void,
-  onclose: (Event) => void,
-  onerror: (Event) => void
-): Promise<(msg: string) => void> {
-  let socket;
-  if (typeof window === "undefined") {
-    // @ts-expect-error
-    let W3CWebSocket = require("websocket").w3cwebsocket;
+  onmessage: (msg: string ) => void,
+  onclose: (e: Event) => void,
+  onerror: (e: Event) => void
+): Promise<(data: ProtoMessage) => void> {
+  let socket = new WebSocket(uri);
 
-    socket = new W3CWebSocket(uri);
-  } else {
-    socket = new WebSocket(uri);
-  }
-
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve, _reject) => {
     socket.onmessage = function (event) {
-      const blb = event.data;
+      const data = event.data;
       const reader = new FileReader();
-      if (typeof window === "undefined") {
-        let string = new TextDecoder().decode(blb);
-        onmessage(string);
+      if(typeof data === "string") {
+        onmessage(data)
       } else {
         reader.addEventListener(
           "load",
           () => {
-            onmessage(reader.result);
+            // we know it will be a string because we called readAsText
+            onmessage((reader.result || "") as string);
           },
           false
         );
-        reader.readAsText(blb);
+        reader.readAsText(data);
       }
     };
     socket.onclose = onclose;
     socket.onerror = onerror;
-    socket.onopen = function (event) {
+    socket.onopen = function (_event) {
       onopen();
-      resolve(function (msg) {
-        let enc = new TextEncoder();
-        socket.send(enc.encode(msg));
+      resolve(function (data: object) {
+        socket.send(JSON.stringify(data));
       });
     };
   });
 }
 
-function runServer(uri: string, cmd: string, stdin: string): Promise<string> {
+async function makeRequest(uri: string, request: ProtoRequest): Promise<string> {
   let data = "";
   return new Promise((resolve, reject) => {
     makeWebSocket(
@@ -178,26 +229,48 @@ function runServer(uri: string, cmd: string, stdin: string): Promise<string> {
         data += msg;
       },
       function (_) {
-        resolve(data);
+        resolve((JSON.parse(data) as ProtoData).data);
       },
       function (err) {
         reject(err);
       }
-    ).then((writeParam) => {
-      let write = writeParam as (msg: string) => void;
-      write(cmd + "\n");
-      write(stdin + "\n");
-      write("END\n");
+    ).then((write) => {
+      write(request);
     });
   });
 }
 
-async function runServerWriteForever(
+// socket that delivers
+async function makeOutputStream(
   uri: string,
-  cmd: string
-): Promise<(msg: string) => void> {
-  let data = "";
+  request: ProtoRequest,
+  onopen: () => void,
+  onmessage: (msg: ProtoData) => void
+): Promise<void> {
+  return makeWebSocket(
+    uri,
+    onopen,
+    function (msg) {
+      // TODO: probably should have some schema check, but I hope we
+      // don't keep json around long enough to warrant writing it.
+      onmessage(JSON.parse(msg));
+    },
+    function (_) {
+      console.log("Error connection lost");
+    },
+    function (_err) {
+      console.log("Error connection lost");
+    }
+  ).then((write) => {
+    write(request);
+  });
+}
 
+// socket that can be written to
+async function makeInputStream(
+  uri: string,
+  request: ProtoRequest
+): Promise<(data: ProtoData) => void> {
   let write = await makeWebSocket(
     uri,
     function () {},
@@ -205,40 +278,15 @@ async function runServerWriteForever(
       console.log("Error writing: " + change);
     },
     function (exn) {
-      console.log("Error connection lost: " + cmd);
+      console.log("Error connection lost: " + request);
     },
     function (err) {
       console.log("Error connection lost");
     }
   );
 
-  write(cmd + "\n");
+  write(request);
   return write;
-}
-
-function runServerForever(
-  uri: string,
-  onopen: () => void,
-  cmd: string,
-  stdin: string,
-  onClose: (Event) => void
-): Promise<void> {
-  let data = "";
-
-  return makeWebSocket(
-    uri,
-    onopen,
-    onClose,
-    function (_) {
-      console.log("Error connection lost");
-    },
-    function (err) {
-      console.log("Error connection lost");
-    }
-  ).then((write) => {
-    write(cmd + "\n");
-    write(stdin + "\n");
-  });
 }
 
 /* ***************************************************************************/
@@ -363,7 +411,7 @@ class SKDBCallable<T1, T2> {
 /* The function that creates the database. */
 /* ***************************************************************************/
 
-class SKDB {
+export class SKDB {
   private subscriptionCount: number = 0;
   private args: Array<string> = [];
   private current_stdin: number = 0;
@@ -383,8 +431,7 @@ class SKDB {
   private rootsAreInitialized = false;
   private roots: Map<string, number> = new Map();
   private pageSize: number = -1;
-  // @ts-expect-error
-  private db: IDBDatabase;
+  private db: IDBDatabase | null = null;
   private dirtyPagesMap: Array<number> = [];
   private dirtyPages: Array<number> = [];
   private working: number = 0;
@@ -399,22 +446,11 @@ class SKDB {
   static async create(reboot: boolean): Promise<SKDB> {
     let storeName = "SKDBStore";
     let client = new SKDB(storeName);
-    if (typeof window === "undefined") {
-      let pageBitSize = 16;
-      client.pageSize = 1 << pageBitSize;
-    } else {
-      let pageBitSize = 20;
-      client.pageSize = 1 << pageBitSize;
-    }
-    let source: ArrayBuffer;
-    if (typeof window === "undefined") {
-      // @ts-expect-error
-      source = fs.readFileSync("build/out32.wasm");
-    } else {
-      let mod = await fetch("out32.wasm");
-      source = await mod.arrayBuffer();
-    }
-    let typedArray = new Uint8Array(source);
+    let pageBitSize = 20;
+    client.pageSize = 1 << pageBitSize;
+    let wasmModule = await fetch(new URL("out32.wasm", import.meta.url));
+    let wasmBuffer = await wasmModule.arrayBuffer();
+    let typedArray = new Uint8Array(wasmBuffer);
     let env = client.makeWasmImports();
     let wasm = await WebAssembly.instantiate(typedArray, { env: env });
     let exports = wasm.instance.exports as unknown as WasmExports;
@@ -424,8 +460,12 @@ class SKDB {
     exports.SKIP_skfs_end_of_init();
     client.nbrInitPages = exports.SKIP_get_persistent_size() / client.pageSize + 1;
     let version = exports.SKIP_get_version();
+    let dbName = "SKDBIndexedDB";
+    if(reboot) {
+      await clearSKDBStore(dbName, storeName);
+    }
     client.db = await makeSKDBStore(
-      "SKDBIndexedDB",
+      dbName,
       storeName,
       version,
       exports.memory.buffer,
@@ -450,10 +490,11 @@ class SKDB {
     user: string,
     password: string
   ): Promise<number> {
-    let cmd = "skdb --data " + db;
-    password = '"' + password + '"';
-    let result = await runServer(uri, cmd, "select id(), uid('" + user + "');");
-    const [sessionID, userID] = result.split("|").map((x) => parseInt(x));
+    let result = await makeRequest(uri, {
+      request: "query",
+      query: "select id();",
+    });
+    const [sessionID] = result.split("|").map((x) => parseInt(x));
     let serverID = this.servers.length;
     let server = new SKDBServer(
       this,
@@ -462,7 +503,7 @@ class SKDB {
       db,
       user,
       password,
-      userID,
+      999,                      // TODO: user id needs to be discovered by query
       sessionID
     );
     this.servers.push(server);
@@ -501,10 +542,6 @@ class SKDB {
       __setErrNo: function (err) {
         throw new Error("ErrNo " + err);
       },
-      SKIP_print_char: function (c) {
-        output(String.fromCharCode(c));
-      },
-      printf: function (ptr) {},
       SKIP_call_external_fun: function (funId, str) {
         return encodeUTF8(
           data.exports,
@@ -516,7 +553,7 @@ class SKDB {
         );
       },
       SKIP_print_error: function (str) {
-        error(wasmStringToJS(data.exports, str));
+        console.error(wasmStringToJS(data.exports, str));
       },
       SKIP_read_line_fill: function () {
         data.lineBuffer = [];
@@ -590,7 +627,11 @@ class SKDB {
       let pages = this.dirtyPages;
       this.dirtyPages = [];
       this.dirtyPagesMap = [];
-      let tx = this.db.transaction(this.storeName, "readwrite");
+      let db = this.db;
+      if(db == null) {
+        return;
+      }
+      let tx = db.transaction(this.storeName, "readwrite");
       let store = tx.objectStore(this.storeName);
       for (let j = 0; j < pages.length; j++) {
         let page = pages[j];
@@ -690,29 +731,22 @@ class SKDB {
     suffix: string
   ): Promise<number> {
     let objThis = this;
-    let cmd = ["TAIL", db, user, password, tableName].join(",");
-    //    console.log(cmd);
-    return new Promise((resolve, reject) => {
-      let strData = "";
-      runServerForever(
+    return new Promise((resolve, _reject) => {
+      makeOutputStream(
         uri,
+        {
+          request: "tail",
+          user: user,
+          password: password,
+          table: tableName,
+        },
         function () {
           resolve(0);
         },
-        cmd,
-        "",
-        function (msg) {
+        function (data: ProtoData) {
+          let msg = data.data;
           if (msg != "") {
-            //          console.log('retrieve remote', msg, '>>END');
-            let index = msg.lastIndexOf("\n");
-            if (index < msg.length) {
-              index++;
-            }
-            let newData = msg.slice(index);
-            msg = strData + msg.slice(0, index);
-            strData = newData;
-            //          console.log('BEGIN' + msg + 'END');
-            objThis.runLocal(["--write-csv", tableName + suffix], msg);
+            objThis.runLocal(["--write-csv", tableName + suffix], msg + '\n');
           }
         }
       );
@@ -721,23 +755,20 @@ class SKDB {
 
   async connectWriteTable(
     uri: string,
-    db: string,
     user: string,
     password: string,
     tableName: string
   ): Promise<(txt: string) => void> {
-    let cmd =
-      "skdb --data " +
-      db +
-      " --user " +
-      user +
-      " --password " +
-      password +
-      " --write-csv " +
-      tableName;
-
-    let write = await runServerWriteForever(uri, cmd);
-    return write;
+    let write = await makeInputStream(uri, {
+      request: "write",
+      user: user,
+      password: password,
+      table: tableName,
+    });
+    return (data) => write({
+      request: "pipe",
+      data: data,
+    });
   }
 
   getSessionID(tableName: string): number {
@@ -872,23 +903,15 @@ class SKDBServer {
     this.sessionID = sessionID;
   }
 
-  async cmd(passwd: string, args: string[], stdin: string): Promise<string> {
-    if (passwd != "admin1234") {
-      console.log("Error: wrong admin password");
-      return "";
-    }
-    const cmdline = "skdb --data " + this.db + " " + args.join(" ");
-    let result = await runServer(this.uri, cmdline, stdin);
-    return result;
-  }
-
   async sqlRaw(passwd: string, stdin: string): Promise<string> {
     if (passwd != "admin1234") {
       console.log("Error: wrong admin password");
       return "";
     }
-    const cmd = "skdb --data " + this.db;
-    let result = await runServer(this.uri, cmd, stdin);
+    let result = await makeRequest(this.uri, {
+      request: "query",
+      query: stdin,
+    });
     return result;
   }
 
@@ -897,8 +920,11 @@ class SKDBServer {
       console.log("Error: wrong admin password");
       return [];
     }
-    let cmd = "skdb --json --data " + this.db;
-    let result = await runServer(this.uri, cmd, stdin);
+    let result = await makeRequest(this.uri, {
+      request: "query",
+      query: stdin,
+      format: "json",
+    });
     return result
       .split("\n")
       .filter((x) => x != "")
@@ -907,30 +933,23 @@ class SKDBServer {
 
   async mirrorTable(tableName: string): Promise<void> {
     let remoteSuffix = "_remote_" + this.serverID;
-    let remoteCmd =
-      "skdb --data " +
-      this.db +
-      " --dump-table " +
-      tableName +
-      " --table-suffix " +
-      remoteSuffix;
-    let createRemoteTable = await runServer(this.uri, remoteCmd, "");
+    let createRemoteTable = await makeRequest(this.uri, {
+      request: "dumpTable",
+      table: tableName,
+      suffix: remoteSuffix,
+    });
     this.client.runLocal([], createRemoteTable);
 
     let localSuffix = "_local";
-    let localCmd =
-      "skdb --data " +
-      this.db +
-      " --dump-table " +
-      tableName +
-      " --table-suffix " +
-      localSuffix;
-    let createLocalTable = await runServer(this.uri, localCmd, "");
+    let createLocalTable = await makeRequest(this.uri, {
+      request: "dumpTable",
+      table: tableName,
+      suffix: localSuffix,
+    });
     this.client.runLocal([], createLocalTable);
 
     let write = await this.client.connectWriteTable(
       this.uri,
-      this.db,
       this.user,
       this.password,
       tableName
@@ -971,13 +990,12 @@ class SKDBServer {
   }
 
   async mirrorView(tableName: string, suffix?: string): Promise<void> {
-    let remoteCmd = "skdb --data " + this.db + " --dump-table " + tableName;
-    if (suffix == undefined) {
-      suffix = "";
-    } else {
-      remoteCmd = remoteCmd + " --table-suffix " + suffix;
-    }
-    let createRemoteTable = await runServer(this.uri, remoteCmd, "");
+    suffix = suffix || "";
+    let createRemoteTable = await makeRequest(this.uri, {
+      request: "dumpTable",
+      table: tableName,
+      suffix: suffix,
+    });
     this.client.runLocal([], createRemoteTable);
 
     await this.client.connectReadTable(
@@ -992,123 +1010,3 @@ class SKDBServer {
     this.client.setMirroredTable(tableName, this.sessionID);
   }
 }
-
-async function initDB(): Promise<void> {
-  const skdb = await SKDB.create(true);
-  skdb.sql("create table t1 (a INTEGER);");
-  let sizeCount = 20;
-
-  for (let i = 0; i < sizeCount; i++) {
-    skdb.insert("t1", [i]);
-  }
-
-  let sumLessThan = skdb.registerFun((i) => {
-    let result = skdb.trackedQuery(
-      `select sum(a) as count from t1 where a < ${i};`
-    );
-    return result[0].count;
-  });
-
-  let first10 = skdb.registerFun((_) => {
-    return skdb.trackedQuery(`select * from t1;`);
-  });
-
-  skdb.addRoot("first10", first10, null);
-  console.log(skdb.getRoot("first10"));
-
-  let buildRoot = skdb.registerFun((i) => {
-    return { rootNbr: i, rootCount: skdb.trackedCall(sumLessThan, i) };
-  });
-
-  for (let i = 0; i < sizeCount; i++) {
-    skdb.addRoot(`root${i}`, buildRoot, i);
-  }
-
-  for (let i = 0; i < sizeCount; i++) {
-    console.log("Root value: " + skdb.getRoot(`root${i}`));
-  }
-
-  skdb.onRootChange((x) =>
-    console.log(`Root ${x} changed: ${skdb.getRoot(x)}`)
-  );
-
-  for (let i = 0; i < sizeCount; i++) {
-    skdb.cmd(["--backtrace"], `delete from t1 where a = ${i};`);
-  }
-
-  for (let i = 0; i < sizeCount; i++) {
-    console.log("Root value: " + skdb.getRoot(`root${i}`));
-  }
-
-  //  skdb.insert('t1', [2]);
-  //  console.log(skdb.getRoot('root2'));
-  //  console.log('done');
-}
-
-async function testDB(): Promise<void> {
-  const skdb = await SKDB.create(true);
-  console.log(skdb.sql("select count(*) from tracks;")[0]);
-
-  let then = performance.now();
-
-  for (let i = 30000; i < 40000; i++) {
-    skdb.insert("tracks", [i, "track" + i, 0, 0, i, "album" + i]);
-  }
-  console.log(performance.now() - then);
-  console.log(skdb.sql("select count(*) from tracks;")[0]);
-}
-
-// initDB();
-//testDB();
-
-async function promptDB() {
-  let skdb = await SKDB.create(true);
-  let sessionID = await skdb.connect(
-    "ws://127.0.0.1:3048",
-    "test.db",
-    "julienv",
-    "passjulienv"
-  );
-  await skdb.server().mirrorView("all_users");
-  //  await skdb.server().mirrorView("all_groups");
-  //  await skdb.server().mirrorTable("user_profiles");
-  //  await skdb.server().mirrorTable("whitelist_skiplabs_employees");
-  //  await skdb.server().mirrorTable("posts");
-  //  await skdb.server().mirrorTable("all_access");
-
-  //  skdb.newServer("ws://127.0.0.1:3048", "test.db", "user6");
-  //  await skdb.server().mirrorTable('posts');
-  //  skdb.sql('create virtual view posts2 as select * from posts where localID % 2 = 0;');
-  //  skdb.subscribe('posts2', function(str) {
-  //    console.log('Recieved a change: ' + str);
-  //  });
-  //  skdb.sql("insert into posts_local values (4,44,74,6,'The second post!');")
-  //  console.log(skdb.sql('select * from posts2;'));
-  //  console.log(skdb.sql('select * from posts;'));
-  //  console.log(skdb.sql('insert into posts_local values(1,38,74,6, NULL);'));
-  //  console.log(skdb.sql('select * from posts;'));
-
-  // @ts-expect-error
-  var rl = readline.createInterface({
-    // @ts-expect-error
-    input: process.stdin,
-    // @ts-expect-error
-    output: process.stdout,
-  });
-
-  var recursiveAsyncReadLine = function () {
-    rl.question("js> ", function (query) {
-      if (query == "quit") return rl.close();
-      try {
-        console.log(eval(query));
-      } catch (exn) {
-        console.log("Error: " + exn);
-      }
-      recursiveAsyncReadLine();
-    });
-  };
-
-  recursiveAsyncReadLine();
-}
-//initDB();
-//promptDB();
