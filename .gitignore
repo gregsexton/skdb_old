@@ -5,3 +5,23 @@ docs/commands_expected
 docs/commands_result
 wasm/build/
 
+node_modules
+.idea/
+.DS_Store
+
+tmp*
+dist
+
+/.yarn/*
+!/.yarn/releases
+!/.yarn/patches
+!/.yarn/plugins
+!/.yarn/sdks
+
+*.tsbuildinfo
+
+*.log
+
+.envrc.local
+
+.direnv
