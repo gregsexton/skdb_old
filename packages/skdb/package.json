@@ -1,5 +1,5 @@
 {
-  "name": "skdb-experimental",
+  "name": "skdb",
   "version": "0.0.12",
   "files": [
     "src",

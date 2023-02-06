@@ -16,6 +16,6 @@
   },
   "packageManager": "yarn@3.2.2",
   "resolutions": {
-    "skdb-experimental": "workspace:*"
+    "skdb": "workspace:*"
   }
 }

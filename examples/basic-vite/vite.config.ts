@@ -5,6 +5,6 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   optimizeDeps: {
-    exclude: ['skdb-experimental'], // TODO remove once fixed https://github.com/vitejs/vite/issues/8427
+    exclude: ['skdb'], // TODO remove once fixed https://github.com/vitejs/vite/issues/8427
   },
 })

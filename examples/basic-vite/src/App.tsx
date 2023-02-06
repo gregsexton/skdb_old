@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import reactLogo from './assets/react.svg'
-import { SKDB } from 'skdb-experimental'
+import { SKDB } from 'skdb'
 import './App.css'
 
 const resetSKDBOnReload = true

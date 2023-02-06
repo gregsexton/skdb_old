@@ -645,7 +645,7 @@ __metadata:
     "@vitejs/plugin-react": ^3.0.1
     react: ^18.2.0
     react-dom: ^18.2.0
-    skdb-experimental: latest
+    skdb: latest
     typescript: ^4.9.4
     vite: ^4.0.4
   languageName: unknown
@@ -1708,9 +1708,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"skdb-experimental@workspace:*, skdb-experimental@workspace:packages/skdb":
+"skdb@workspace:*, skdb@workspace:packages/skdb":
   version: 0.0.0-use.local
-  resolution: "skdb-experimental@workspace:packages/skdb"
+  resolution: "skdb@workspace:packages/skdb"
   languageName: unknown
   linkType: soft
 
