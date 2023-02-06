@@ -155,6 +155,7 @@ type ProtoTail = {
   table: string;
   user: string;
   password: string;
+  since: number;
 }
 
 type ProtoDumpTable = {
@@ -238,55 +239,6 @@ async function makeRequest(uri: string, request: ProtoRequest): Promise<string> 
       write(request);
     });
   });
-}
-
-// socket that delivers
-async function makeOutputStream(
-  uri: string,
-  request: ProtoRequest,
-  onopen: () => void,
-  onmessage: (msg: ProtoData) => void
-): Promise<void> {
-  return makeWebSocket(
-    uri,
-    onopen,
-    function (msg) {
-      // TODO: probably should have some schema check, but I hope we
-      // don't keep json around long enough to warrant writing it.
-      onmessage(JSON.parse(msg));
-    },
-    function (_) {
-      console.log("Error connection lost");
-    },
-    function (_err) {
-      console.log("Error connection lost");
-    }
-  ).then((write) => {
-    write(request);
-  });
-}
-
-// socket that can be written to
-async function makeInputStream(
-  uri: string,
-  request: ProtoRequest
-): Promise<(data: ProtoData) => void> {
-  let write = await makeWebSocket(
-    uri,
-    function () {},
-    function (change) {
-      console.log("Error writing: " + change);
-    },
-    function (exn) {
-      console.log("Error connection lost: " + request);
-    },
-    function (err) {
-      console.log("Error connection lost");
-    }
-  );
-
-  write(request);
-  return write;
 }
 
 /* ***************************************************************************/
@@ -486,12 +438,21 @@ export class SKDB {
   }
 
   async connect(
-    uri: string,
     db: string,
     user: string,
-    password: string
+    password: string,
+    endpoint?: string,
   ): Promise<number> {
-    let result = await makeRequest(uri, {
+    if (!endpoint) {
+      if (typeof window === 'undefined') {
+        throw new Error("No endpoint passed to connect and no window object to infer from.");
+      }
+      const loc = window.location;
+      const scheme = loc.protocol === "https:" ? "wss://" : "ws://"
+      endpoint = `${scheme}${loc.host}`
+    }
+
+    let result = await makeRequest(SKDBServer.getDbSocketUri(endpoint, db), {
       request: "query",
       query: "select id();",
     });
@@ -500,11 +461,10 @@ export class SKDB {
     let server = new SKDBServer(
       this,
       serverID,
-      uri,
+      endpoint,
       db,
       user,
       password,
-      999,                      // TODO: user id needs to be discovered by query
       sessionID!
     );
     this.servers.push(server);
@@ -718,39 +678,88 @@ export class SKDB {
     this.subscriptionCount++;
     let fileName = "/subscriptions/jsroots";
     this.runLocal(
-      ["--json", "--subscribe", "jsroots", "--updates", fileName],
+      ["subscribe", "jsroots", "--format=json", "--updates", fileName],
       ""
     );
   }
 
+  watermark(table: string): number {
+    return parseInt(this.runLocal(["watermark", table], ""));
+  }
+
   connectReadTable(
     uri: string,
-    db: string,
     user: string,
     password: string,
     tableName: string,
-    suffix: string
-  ): Promise<number> {
+    suffix: string,
+  ): Promise<void> {
     let objThis = this;
+
+    const request: ProtoTail = {
+      request: "tail",
+      user: user,
+      password: password,
+      table: tableName,
+      since: objThis.watermark(tableName + suffix),
+    };
+
     return new Promise((resolve, _reject) => {
-      makeOutputStream(
-        uri,
-        {
-          request: "tail",
-          user: user,
-          password: password,
-          table: tableName,
-        },
-        function () {
-          resolve(0);
-        },
-        function (data: ProtoData) {
+      const socket = new WebSocket(uri);
+      const failureThresholdMs = 60000;
+      let failureTimeout: number|undefined = undefined;
+
+      const reconnect = (_event: Event) => {
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+        clearTimeout(failureTimeout);
+
+        const backoffMs = 500 + Math.random() * 1000;
+        setTimeout(() => {
+          objThis.connectReadTable(uri, user, password, tableName, suffix);
+        }, backoffMs)
+      };
+
+      socket.onmessage = function (event) {
+        clearTimeout(failureTimeout);
+
+        const deliver = (data: ProtoData) => {
           let msg = data.data;
           if (msg != "") {
-            objThis.runLocal(["--write-csv", tableName + suffix], msg + '\n');
+            objThis.runLocal(["write-csv", tableName + suffix], msg + '\n');
           }
+          failureTimeout = setTimeout(reconnect, failureThresholdMs);
+        };
+
+        const data = event.data;
+
+        if(typeof data === "string") {
+          deliver(JSON.parse(data))
+        } else {
+          const reader = new FileReader();
+          reader.addEventListener(
+            "load",
+            () => {
+              let msg = JSON.parse((reader.result || "") as string);
+              // we know it will be a string because we called readAsText
+              deliver(msg);
+            },
+            false
+          );
+          reader.readAsText(data);
         }
-      );
+      };
+
+      socket.onclose = reconnect;
+      socket.onerror = reconnect;
+
+      socket.onopen = function (_event) {
+        socket.send(JSON.stringify(request));
+        failureTimeout = setTimeout(reconnect, failureThresholdMs);
+        resolve();
+      };
     });
   }
 
@@ -758,17 +767,108 @@ export class SKDB {
     uri: string,
     user: string,
     password: string,
-    tableName: string
-  ): Promise<(txt: string) => void> {
-    let write = await makeInputStream(uri, {
-      request: "write",
-      user: user,
-      password: password,
-      table: tableName,
-    });
-    return (data) => write({
-      request: "pipe",
-      data: data,
+    tableName: string,
+    suffix: string,
+    session: string | undefined = undefined,
+  ): Promise<void> {
+    let objThis = this;
+
+    const request: ProtoWrite = {
+       request: "write",
+       user: user,
+       password: password,
+       table: tableName,
+    };
+
+    return new Promise((resolve, _reject) => {
+      let sessionId = session;
+      const socket = new WebSocket(uri);
+      const failureThresholdMs = 60000;
+      let failureTimeout: number|undefined = undefined;
+
+      const reconnect = (_event: Event) => {
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+        clearTimeout(failureTimeout);
+
+        const backoffMs = 500 + Math.random() * 1000;
+        setTimeout(() => {
+          objThis.connectWriteTable(uri, user, password, tableName, suffix, sessionId);
+        }, backoffMs)
+      };
+
+      socket.onmessage = function (event) {
+        clearTimeout(failureTimeout);
+
+        const deliver = (data: ProtoData) => {
+          let msg = data.data;
+          if (msg != "") {
+            // we only expect acks back in the form of checkpoints.
+            // let's store these as a watermark against the table.
+            objThis.runLocal(["write-csv", tableName + suffix], msg + '\n');
+          }
+        };
+
+        const data = event.data;
+
+        if(typeof data === "string") {
+          deliver(JSON.parse(data))
+        } else {
+          const reader = new FileReader();
+          reader.addEventListener(
+            "load",
+            () => {
+              let msg = JSON.parse((reader.result || "") as string);
+              // we know it will be a string because we called readAsText
+              deliver(msg);
+            },
+            false
+          );
+          reader.readAsText(data);
+        }
+      };
+
+      socket.onclose = reconnect;
+      socket.onerror = reconnect;
+
+      const write = (data: string) => {
+        socket.send(JSON.stringify({
+          request: "pipe",
+          data: data,
+        }));
+        // we expect an ack within a reasonable amount of time
+        failureTimeout = setTimeout(reconnect, failureThresholdMs);
+      };
+
+      socket.onopen = function (_event) {
+        socket.send(JSON.stringify(request));
+
+        if (!session) {
+          let fileName = tableName + "_" + user;
+          objThis.attach(change => {
+            write(change);
+          });
+          sessionId = objThis.runLocal(
+            [
+              "subscribe", tableName + suffix, "--connect", "--format=csv", "--updates", fileName
+            ],
+            ""
+          ).trim();
+        } else {
+          const diff = objThis.runLocal(
+            [
+              "diff", "--format=csv",
+              "--since", objThis.watermark(tableName + suffix).toString(),
+              session,
+            ], "");
+
+          write(diff);
+        }
+
+        resolve();
+      };
     });
   }
 
@@ -838,7 +938,7 @@ export class SKDB {
     let fileName = "/subscriptions/sub" + this.subscriptionCount;
     this.subscriptionCount++;
     this.runLocal(
-      ["--csv", "--subscribe", viewName, "--updates", fileName],
+      ["subscribe", viewName, "--format=csv", "--updates", fileName],
       ""
     );
   }
@@ -848,7 +948,7 @@ export class SKDB {
   }
 
   sql(stdin: string): Array<any> {
-    return this.runLocal(["--json"], stdin)
+    return this.runLocal(["--format=json"], stdin)
       .split("\n")
       .filter((x) => x != "")
       .map((x) => JSON.parse(x));
@@ -881,27 +981,28 @@ class SKDBServer {
   private db: string;
   private user: string;
   private password: string;
-  private userID: number;
   private sessionID: number;
 
   constructor(
     client: SKDB,
     serverID: number,
-    uri: string,
+    endpoint: string,
     db: string,
     user: string,
     password: string,
-    userID: number,
     sessionID: number
   ) {
     this.client = client;
     this.serverID = serverID;
-    this.uri = uri;
+    this.uri = SKDBServer.getDbSocketUri(endpoint, db);
     this.db = db;
     this.user = user;
     this.password = password;
-    this.userID = userID;
     this.sessionID = sessionID;
+  }
+
+  static getDbSocketUri(endpoint: string, db: string) {
+    return `${endpoint}/dbs/${db}/connection`;
   }
 
   async sqlRaw(passwd: string, stdin: string): Promise<string> {
@@ -949,29 +1050,20 @@ class SKDBServer {
     });
     this.client.runLocal([], createLocalTable);
 
-    let write = await this.client.connectWriteTable(
+    await this.client.connectWriteTable(
       this.uri,
       this.user,
       this.password,
-      tableName
-    );
-
-    let fileName = tableName + "_" + this.user;
-    this.client.attach(change => {
-      write(change);
-    });
-    this.client.runLocal(
-      ["--csv", "--connect", tableName + localSuffix, "--updates", fileName],
-      ""
+      tableName,
+      localSuffix
     );
 
     await this.client.connectReadTable(
       this.uri,
-      this.db,
       this.user,
       this.password,
       tableName,
-      remoteSuffix
+      remoteSuffix,
     );
 
     this.client.setMirroredTable(tableName, this.sessionID);
@@ -1001,11 +1093,10 @@ class SKDBServer {
 
     await this.client.connectReadTable(
       this.uri,
-      this.db,
       this.user,
       this.password,
       tableName,
-      suffix
+      suffix,
     );
 
     this.client.setMirroredTable(tableName, this.sessionID);
