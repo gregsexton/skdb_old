@@ -139,22 +139,21 @@ function makeSKDBStore(
 }
 
 /* ***************************************************************************/
-/* Primitives to connect to websockets. */
+/* Protocol schema. */
 /* ***************************************************************************/
-
-// protocol schema
 
 type ProtoAuth = {
   request: "auth";
   accessKey: string;
   date: string;
+  nonce: string;
   signature: string;
 }
 
 type ProtoQuery = {
   request: "query";
   query: string;
-  format?: "json";
+  format?: "json"|"raw";
 }
 
 type ProtoTail = {
@@ -163,10 +162,11 @@ type ProtoTail = {
   since: number;
 }
 
-type ProtoDumpTable = {
-  request: "dumpTable";
-  table: string;
-  suffix: string;
+type ProtoSchemaQuery = {
+  request: "schema";
+  table?: string;
+  view?: string;
+  suffix?: string;
 }
 
 type ProtoWrite = {
@@ -174,10 +174,25 @@ type ProtoWrite = {
   table: string;
 }
 
-// control plane
-type ProtoRequest = ProtoQuery | ProtoTail | ProtoDumpTable | ProtoWrite;
+type ProtoCreateDb = {
+  request: "createDatabase";
+  name: string;
+}
 
-// data plane
+type ProtoCreateUser = {
+  request: "createUser";
+}
+
+type ProtoCredentials = {
+  request: "credentials";
+  accessKey: String;
+  privateKey: String;
+}
+
+type ProtoRequest = ProtoQuery | ProtoSchemaQuery | ProtoCreateDb | ProtoTail | ProtoWrite | ProtoCreateUser
+
+type ProtoResponse = ProtoData | ProtoCredentials
+
 type ProtoData = {
   request: "pipe";
   data: string;
@@ -411,7 +426,10 @@ export class SKDB {
       request: "query",
       query: "select id();",
     });
-    const [sessionID] = result.split("|").map((x) => parseInt(x));
+    if (result.request !== "pipe") {
+      throw new Error("Unexpected response.");
+    }
+    const [sessionID] = result.data.split("|").map((x) => parseInt(x));
     let serverID = this.servers.length;
     let server = new SKDBServer(
       this,
@@ -647,7 +665,10 @@ export class SKDB {
     const enc = new TextEncoder();
     const reqType = "auth"
     const now = (new Date()).toISOString()
-    const bytesToSign = enc.encode(reqType + creds.accessKey + now)
+    const nonce = new Uint8Array(8);
+    crypto.getRandomValues(nonce)
+    const b64nonce = btoa(String.fromCharCode(...nonce));
+    const bytesToSign = enc.encode(reqType + creds.accessKey + now + b64nonce)
     const sig = await crypto.subtle.sign(
       "HMAC",
       creds.privateKey,
@@ -657,45 +678,25 @@ export class SKDB {
       request: reqType,
       accessKey: creds.accessKey,
       date: now,
+      nonce: b64nonce,
       signature: btoa(String.fromCharCode(...new Uint8Array(sig))),
     };
   }
 
-  async makeRequest(uri: string, creds: Creds, request: ProtoRequest): Promise<string> {
+  async makeRequest(uri: string, creds: Creds, request: ProtoRequest): Promise<ProtoResponse> {
     let objThis = this;
-    let data = "";
     let socket = new WebSocket(uri);
-    const onmessage = function (msg: string) {
-      data += msg;
-    };
 
     const authMsg = await objThis.createAuthMsg(creds)
 
     return new Promise((resolve, reject) => {
       socket.onmessage = function (event) {
         const data = event.data;
-        const reader = new FileReader();
-        if(typeof data === "string") {
-          onmessage(data)
-        } else {
-          reader.addEventListener(
-            "load",
-            () => {
-              // we know it will be a string because we called readAsText
-              onmessage((reader.result || "") as string);
-            },
-            false
-          );
-          reader.readAsText(data);
-        }
+        resolve(JSON.parse(data));
+        socket.close();
       };
       socket.onclose = () => {
-        if (data === "") {
-          reject(new Error(`Empty response to request: ${request}`));
-          return;
-        }
-        const recvData = JSON.parse(data) as ProtoData;
-        resolve(recvData.data);
+        reject();
       };
       socket.onerror = (err) => reject(err);
       socket.onopen = function (_event) {
@@ -965,6 +966,18 @@ export class SKDB {
       .map((x) => JSON.parse(x));
   }
 
+  tableSchema(tableName: string): string {
+    return this.runLocal(["dump-table", tableName], "");
+  }
+
+  viewSchema(viewName: string, renameSuffix: string = ""): string {
+    return this.runLocal(["dump-view", viewName], "");
+  }
+
+  schema(): string {
+    return this.runLocal(["dump-tables"], "");
+  }
+
   insert(tableName: string, values: Array<any>): void {
     values = values.map((x) => {
       if (typeof x == "string") {
@@ -1011,12 +1024,21 @@ class SKDBServer {
     return `${endpoint}/dbs/${db}/connection`;
   }
 
+  private castData(response: ProtoResponse): ProtoData {
+    if (response.request === "pipe") {
+      return response;
+    }
+    throw new Error(`Unexpected response: ${response}`);
+  }
+
   async sqlRaw(stdin: string): Promise<string> {
     let result = await this.client.makeRequest(this.uri, this.creds, {
       request: "query",
       query: stdin,
+      format: "raw",
     });
-    return result;
+
+    return this.castData(result).data;
   }
 
   async sql(stdin: string): Promise<any[]> {
@@ -1025,27 +1047,45 @@ class SKDBServer {
       query: stdin,
       format: "json",
     });
-    return result
+    return this.castData(result)
+      .data
       .split("\n")
       .filter((x) => x != "")
       .map((x) => JSON.parse(x));
   }
 
+  async tableSchema(tableName: string, renameSuffix: string = ""): Promise<string> {
+    const resp = await this.client.makeRequest(this.uri, this.creds, {
+      request: "schema",
+      table: tableName,
+      suffix: renameSuffix,
+    });
+    return this.castData(resp).data
+  }
+
+  async viewSchema(viewName: string, renameSuffix: string = ""): Promise<string> {
+    const resp = await this.client.makeRequest(this.uri, this.creds, {
+      request: "schema",
+      view: viewName,
+      suffix: renameSuffix,
+    });
+    return this.castData(resp).data
+  }
+
+  async schema(): Promise<string> {
+    const resp = await this.client.makeRequest(this.uri, this.creds, {
+      request: "schema",
+    });
+    return this.castData(resp).data
+  }
+
   async mirrorTable(tableName: string): Promise<void> {
     let remoteSuffix = "_remote_" + this.serverID;
-    let createRemoteTable = await this.client.makeRequest(this.uri, this.creds, {
-      request: "dumpTable",
-      table: tableName,
-      suffix: remoteSuffix,
-    });
+    let createRemoteTable = await this.tableSchema(tableName, remoteSuffix);
     this.client.runLocal([], createRemoteTable);
 
     let localSuffix = "_local";
-    let createLocalTable = await this.client.makeRequest(this.uri, this.creds, {
-      request: "dumpTable",
-      table: tableName,
-      suffix: localSuffix,
-    });
+    let createLocalTable = await this.tableSchema(tableName, localSuffix);
     this.client.runLocal([], createLocalTable);
 
     await this.client.connectWriteTable(
@@ -1078,22 +1118,39 @@ class SKDBServer {
     );
   }
 
-  async mirrorView(tableName: string, suffix?: string): Promise<void> {
+  async mirrorView(viewName: string, suffix?: string): Promise<void> {
     suffix = suffix || "";
-    let createRemoteTable = await this.client.makeRequest(this.uri, this.creds, {
-      request: "dumpTable",
-      table: tableName,
-      suffix: suffix,
-    });
+    let createRemoteTable = await this.viewSchema(viewName, suffix);
     this.client.runLocal([], createRemoteTable);
 
     await this.client.connectReadTable(
       this.uri,
       this.creds,
-      tableName,
+      viewName,
       suffix,
     );
 
-    this.client.setMirroredTable(tableName, this.sessionID);
+    this.client.setMirroredTable(viewName, this.sessionID);
+  }
+
+  async createDatabase(dbName: string): Promise<ProtoCredentials> {
+    let result = await this.client.makeRequest(this.uri, this.creds, {
+      request: "createDatabase",
+      name: dbName,
+    });
+    if (result.request !== "credentials") {
+      throw new Error("Unexpected response.");
+    }
+    return result;
+  }
+
+  async createUser(): Promise<ProtoCredentials> {
+    let result = await this.client.makeRequest(this.uri, this.creds, {
+      request: "createUser",
+    });
+    if (result.request !== "credentials") {
+      throw new Error("Unexpected response.");
+    }
+    return result;
   }
 }
