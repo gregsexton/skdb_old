@@ -31,9 +31,8 @@ function App() {
           <img src={reactLogo} className="logo react" alt="React logo" />
         </a>
       </div>
-      <h1>Vite + React</h1>
+      <h1>React + SKDB</h1>
       <div className="card">
-        <h2>Result from SKDB</h2>
         <pre>{JSON.stringify(result, null, 2)}</pre>
       </div>
     </div>
