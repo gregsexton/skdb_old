@@ -148,6 +148,7 @@ type ProtoAuth = {
   date: string;
   nonce: string;
   signature: string;
+  deviceUuid: string,
 }
 
 type ProtoQuery = {
@@ -183,6 +184,17 @@ type ProtoCreateUser = {
   request: "createUser";
 }
 
+type ProtoData = {
+  request: "pipe";
+  data: string;
+}
+
+type ProtoError = {
+  request: "error";
+  code: string;
+  msg: string;
+}
+
 type ProtoCredentials = {
   request: "credentials";
   accessKey: String;
@@ -191,16 +203,236 @@ type ProtoCredentials = {
 
 type ProtoRequest = ProtoQuery | ProtoSchemaQuery | ProtoCreateDb | ProtoTail | ProtoWrite | ProtoCreateUser
 
-type ProtoResponse = ProtoData | ProtoCredentials
+type ProtoResponse = ProtoData | ProtoError | ProtoCredentials
 
-type ProtoData = {
-  request: "pipe";
-  data: string;
-}
+type ProtoMessage = ProtoRequest | ProtoResponse
 
 interface Creds {
   accessKey: string,
   privateKey: CryptoKey,
+  deviceUuid: string,
+}
+
+async function createAuthMsg(creds: Creds): Promise<ProtoAuth> {
+  const enc = new TextEncoder();
+  const reqType = "auth"
+  const now = (new Date()).toISOString()
+  const nonce = new Uint8Array(8);
+  crypto.getRandomValues(nonce)
+  const b64nonce = btoa(String.fromCharCode(...nonce));
+  const bytesToSign = enc.encode(reqType + creds.accessKey + now + b64nonce)
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    creds.privateKey,
+    bytesToSign
+  )
+  return {
+    request: reqType,
+    accessKey: creds.accessKey,
+    date: now,
+    nonce: b64nonce,
+    signature: btoa(String.fromCharCode(...new Uint8Array(sig))),
+    deviceUuid: creds.deviceUuid,
+  };
+}
+
+function metadataTable(tableName: string): string {
+  return `skdb__${tableName}_sync_metadata`;
+}
+
+/* ***************************************************************************/
+/* Resilient connection abstraction
+/* ***************************************************************************/
+
+class ResilientConnection {
+
+  // connection params
+  private uri: string;
+  private creds: Creds;
+  private failureThresholdMs = 60000;
+  private onMessage: (data: ProtoData) => void;
+
+  onReconnect?: () => void;
+
+  // state
+  private socket?: WebSocket;
+  private failureTimeout?: number;
+  private reconnectTimeout?: number;
+  // key invariants:
+  // 1. only one failure timeout in flight
+  // 2. only one reconnect attempt in flight at any one time
+  // 3. the socket is either connected and healthy, or we're actively
+  //    attempting a reconnect
+
+  private constructor(
+    uri: string,
+    creds: Creds,
+    onMessage: (data: ProtoData) => void,
+  ) {
+    this.uri = uri;
+    this.creds = creds;
+    this.onMessage = onMessage;
+
+    this.socket = undefined;
+    this.failureTimeout = undefined;
+    this.reconnectTimeout = undefined;
+  }
+
+  private setFailureTimeout(timeout?: number): void {
+    clearTimeout(this.failureTimeout);
+    this.failureTimeout = timeout;
+  }
+
+  private setReconnectTimeout(timeout?: number): void {
+    clearTimeout(this.reconnectTimeout);
+    this.reconnectTimeout = timeout;
+  }
+
+  private connectionHealthy(): void {
+    this.setFailureTimeout(undefined);
+  }
+
+  private async connect(): Promise<WebSocket> {
+    if (this.socket) {
+      throw new Error("Connecting a connected socket")
+    }
+
+    const authMsg = await createAuthMsg(this.creds)
+    const objThis = this;
+
+    let opened = false;
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(this.uri);
+
+      socket.onclose = _event => {
+        if (opened) {
+          objThis.kickOffReconnect();
+        } else {
+          reject();
+        }
+      };
+      socket.onerror = _event => {
+        if (opened) {
+          objThis.kickOffReconnect();
+        } else {
+          reject();
+        }
+      };
+
+      socket.onmessage = function (event) {
+        objThis.connectionHealthy();
+
+        const deliver = (data: ProtoResponse) => {
+          if (data.request !== "pipe") {
+            console.error("Unexpected message received", data);
+            objThis.kickOffReconnect();
+            return;
+          }
+
+          objThis.onMessage(data);
+        };
+
+        const data = event.data;
+
+        if(typeof data === "string") {
+          deliver(JSON.parse(data))
+        } else {
+          const reader = new FileReader();
+          reader.addEventListener(
+            "load",
+            () => {
+              let msg = JSON.parse((reader.result || "") as string);
+              // we know it will be a string because we called readAsText
+              deliver(msg);
+            },
+            false
+          );
+          reader.readAsText(data);
+        }
+      };
+
+      socket.onopen = function (_event) {
+        socket.send(JSON.stringify(authMsg));
+        opened = true;
+        resolve(socket);
+      };
+    });
+  }
+
+  private kickOffReconnect(): void {
+    if (this.reconnectTimeout) {
+      // debounce. e.g. socket onclose and onerror can both be called
+      return
+    }
+
+    if (this.socket) {
+      this.socket.onmessage = null;
+      this.socket.onclose = null;
+      this.socket.onerror = null;
+      this.socket.onopen = null;
+      this.socket.close();
+    }
+
+    this.socket = undefined;
+    this.setFailureTimeout(undefined);
+
+    const backoffMs = 500 + Math.random() * 1000;
+    const objThis = this;
+    const reconnectTimeout = setTimeout(() => {
+      objThis.connect().then(socket => {
+        objThis.socket = socket;
+        objThis.setReconnectTimeout(undefined)
+        if (objThis.onReconnect) {
+          objThis.onReconnect();
+        }
+      }).catch(() => {
+        objThis.setReconnectTimeout(undefined)
+        objThis.kickOffReconnect()
+      });
+    }, backoffMs);
+
+    this.setReconnectTimeout(reconnectTimeout);
+
+    return;
+  }
+
+  static async connect(
+    uri: string, creds: Creds,
+    onMessage: (data: ProtoData) => void
+  ): Promise<ResilientConnection> {
+
+    const conn = new ResilientConnection(uri, creds, onMessage);
+
+    const socket = await conn.connect();
+    conn.socket = socket;
+
+    return conn;
+  }
+
+  expectingData(): void {
+    if (this.failureTimeout) {
+      // already expecting a response
+      return;
+    }
+
+    if (!this.socket) {
+      // can't receive data. we're re-establishing anyway
+      return;
+    }
+
+    const objThis = this;
+    const timeout = setTimeout(() => objThis.kickOffReconnect(), this.failureThresholdMs);
+    this.setFailureTimeout(timeout);
+  }
+
+  write(data: ProtoMessage): void {
+    if (!this.socket) {
+      // black hole the data. we're reconnecting and will call
+      // onReconnect that should address the gap
+      return;
+    }
+    this.socket.send(JSON.stringify(data));
+  }
 }
 
 /* ***************************************************************************/
@@ -347,10 +579,15 @@ export class SKDB {
   private db: IDBDatabase | null = null;
   private dirtyPagesMap: Array<number> = [];
   private dirtyPages: Array<number> = [];
-  private working: number = 0;
+  private transaction: number = 0;
+  private syncIsRunning: boolean = false;
   private mirroredTables: Map<string, number> = new Map();
   // @ts-expect-error
   private exports: WasmExports;
+  private localToServerSyncConnections: Map<string, ResilientConnection> = new Map();
+  private serverToLocalSyncConnections: Map<string, ResilientConnection> = new Map();
+  private replication_uid: string = "";
+  private client_uuid: string = "";
 
   private constructor(storeName: string) {
     this.storeName = storeName;
@@ -391,6 +628,9 @@ export class SKDB {
     client.exports.SKIP_init_jsroots();
     client.runSubscribeRoots(reboot);
 
+    client.replication_uid = client.runLocal(["uid"], "").trim();
+    client.client_uuid = crypto.randomUUID();
+
     return client;
   }
 
@@ -420,6 +660,7 @@ export class SKDB {
     const creds = {
       accessKey: accessKey,
       privateKey: privateKey,
+      deviceUuid: this.client_uuid,
     };
 
     let result = await this.makeRequest(SKDBServer.getDbSocketUri(endpoint, db), creds, {
@@ -554,34 +795,6 @@ export class SKDB {
     };
   }
 
-  private storePages(): void {
-    if (this.working == 0 && this.dirtyPages.length != 0) {
-      this.working++;
-      let pages = this.dirtyPages;
-      this.dirtyPages = [];
-      this.dirtyPagesMap = [];
-      let db = this.db;
-      if(db == null) {
-        return;
-      }
-      let tx = db.transaction(this.storeName, "readwrite");
-      let store = tx.objectStore(this.storeName);
-      for (let j = 0; j < pages.length; j++) {
-        let page = pages[j]!;
-        let memory = this.exports.memory.buffer;
-        let start = page * this.pageSize;
-        let end = page * this.pageSize + this.pageSize;
-        let content = memory.slice(start, end);
-        store.put({ pageid: page, content });
-      }
-      tx.onerror = (err) => console.log("Error sync db: " + err);
-      tx.oncomplete = () => {
-        this.working--;
-        this.storePages();
-      };
-    }
-  }
-
   private runAddRoot(rootName: string, funId: number, arg: any): void {
     this.args = [];
     this.stdin = "";
@@ -594,12 +807,75 @@ export class SKDB {
     );
   }
 
+  private async copyPage(start: number, end: number): Promise<ArrayBuffer> {
+    let memory = this.exports.memory.buffer;
+    return memory.slice(start, end);
+  }
+
+  private async storePages(transaction: number): Promise<boolean> {
+    return new Promise((resolve, reject) => (async () => {
+      if(this.db == null) {
+        resolve(true);
+      }
+
+      let pages = this.dirtyPages;
+      let db = this.db!;
+      let tx = db.transaction(this.storeName, "readwrite");
+      tx.onabort = (err) => {
+        resolve(false);
+      }
+      tx.onerror = (err) => {
+        console.log("Error sync db: " + err);
+        resolve(false);
+      }
+      tx.oncomplete = () => {
+        if(transaction == this.transaction) {
+          this.dirtyPages = [];
+          this.dirtyPagesMap = [];
+        };
+        resolve(true);
+      }
+      let copiedPages = new Array();
+      for (let j = 0; j < pages.length; j++) {
+        let page = pages[j]!;
+        let start = page * this.pageSize;
+        let end = page * this.pageSize + this.pageSize;
+        let content = await this.copyPage(start, end);
+        if(this.transaction != transaction) {
+          resolve(false);
+          return;
+        }
+        copiedPages.push({ pageid: page, content });
+      }
+      let store = tx.objectStore(this.storeName);
+      for(let j = 0; j < copiedPages.length; j++) {
+        store.put(copiedPages[j]!);
+      }
+    })());
+
+  }
+
+  private async storePagesLoop() {
+    if(this.syncIsRunning) return;
+    this.syncIsRunning = true;
+    let transaction = -1;
+    while(transaction < this.transaction) {
+      transaction = this.transaction;
+      while(!await this.storePages(transaction)) {
+        if(this.transaction != transaction) break;
+      }
+    }
+    this.syncIsRunning = false;
+  }
+
   runLocal(new_args: Array<string>, new_stdin: string): string {
     console.assert(this.nbrInitPages >= 0);
     this.args = new_args;
     this.stdin = new_stdin;
     this.stdout = new Array();
     this.current_stdin = 0;
+    this.transaction++;
+
     this.exports.skip_main();
 
     while (true) {
@@ -620,7 +896,7 @@ export class SKDB {
       }
     }
 
-    this.storePages();
+    this.storePagesLoop();
     return this.stdout.join("");
   }
 
@@ -661,33 +937,10 @@ export class SKDB {
     return parseInt(this.runLocal(["watermark", table], ""));
   }
 
-  async createAuthMsg(creds: Creds): Promise<ProtoAuth> {
-    const enc = new TextEncoder();
-    const reqType = "auth"
-    const now = (new Date()).toISOString()
-    const nonce = new Uint8Array(8);
-    crypto.getRandomValues(nonce)
-    const b64nonce = btoa(String.fromCharCode(...nonce));
-    const bytesToSign = enc.encode(reqType + creds.accessKey + now + b64nonce)
-    const sig = await crypto.subtle.sign(
-      "HMAC",
-      creds.privateKey,
-      bytesToSign
-    )
-    return {
-      request: reqType,
-      accessKey: creds.accessKey,
-      date: now,
-      nonce: b64nonce,
-      signature: btoa(String.fromCharCode(...new Uint8Array(sig))),
-    };
-  }
-
   async makeRequest(uri: string, creds: Creds, request: ProtoRequest): Promise<ProtoResponse> {
-    let objThis = this;
     let socket = new WebSocket(uri);
 
-    const authMsg = await objThis.createAuthMsg(creds)
+    const authMsg = await createAuthMsg(creds)
 
     return new Promise((resolve, reject) => {
       socket.onmessage = function (event) {
@@ -710,183 +963,99 @@ export class SKDB {
     uri: string,
     creds: Creds,
     tableName: string,
-    suffix: string,
   ): Promise<void> {
     let objThis = this;
 
-    const request: ProtoTail = {
+    const conn = this.serverToLocalSyncConnections[tableName];
+    if (conn) {
+      throw new Error("Trying to connect an already connected table");
+    }
+
+    const newConn = await ResilientConnection.connect(uri, creds, (data: ProtoData) => {
+      let msg = data.data;
+      objThis.runLocal(["write-csv", tableName, "--source", objThis.replication_uid], msg + '\n');
+      newConn.expectingData()
+    });
+    this.localToServerSyncConnections[tableName] = newConn;
+
+    newConn.write({
       request: "tail",
       table: tableName,
-      since: objThis.watermark(tableName + suffix),
-    };
+      since: objThis.watermark(tableName),
+    })
+    newConn.expectingData();
 
-    const authMsg = await objThis.createAuthMsg(creds)
-    return new Promise((resolve, _reject) => {
-      const socket = new WebSocket(uri);
-      const failureThresholdMs = 60000;
-      let failureTimeout: number|undefined = undefined;
-
-      const reconnect = (_event: Event) => {
-        socket.onmessage = null;
-        socket.onclose = null;
-        socket.onerror = null;
-        socket.close();
-        clearTimeout(failureTimeout);
-
-        const backoffMs = 500 + Math.random() * 1000;
-        setTimeout(() => {
-          objThis.connectReadTable(uri, creds, tableName, suffix);
-        }, backoffMs)
-      };
-
-      socket.onmessage = function (event) {
-        clearTimeout(failureTimeout);
-
-        const deliver = (data: ProtoData) => {
-          let msg = data.data;
-          if (msg != "") {
-            objThis.runLocal(["write-csv", tableName + suffix], msg + '\n');
-          }
-          failureTimeout = setTimeout(reconnect, failureThresholdMs);
-        };
-
-        const data = event.data;
-
-        if(typeof data === "string") {
-          deliver(JSON.parse(data))
-        } else {
-          const reader = new FileReader();
-          reader.addEventListener(
-            "load",
-            () => {
-              let msg = JSON.parse((reader.result || "") as string);
-              // we know it will be a string because we called readAsText
-              deliver(msg);
-            },
-            false
-          );
-          reader.readAsText(data);
-        }
-      };
-
-      socket.onclose = reconnect;
-      socket.onerror = reconnect;
-
-      socket.onopen = function (_event) {
-        socket.send(JSON.stringify(authMsg));
-        socket.send(JSON.stringify(request));
-        failureTimeout = setTimeout(reconnect, failureThresholdMs);
-        resolve();
-      };
-    });
+    newConn.onReconnect = () => {
+      newConn.write({
+        request: "tail",
+        table: tableName,
+        since: objThis.watermark(tableName),
+      });
+      newConn.expectingData();
+    }
   }
 
   async connectWriteTable(
     uri: string,
     creds: Creds,
     tableName: string,
-    suffix: string,
-    session: string | undefined = undefined,
   ): Promise<void> {
     let objThis = this;
+
+    const conn = this.localToServerSyncConnections[tableName];
+
+    if (conn) {
+      throw new Error("Trying to connect an already connected table");
+    }
+
+    const newConn = await ResilientConnection.connect(uri, creds, (data: ProtoData) => {
+      let msg = data.data;
+      // we only expect acks back in the form of checkpoints.
+      // let's store these as a watermark against the table.
+      objThis.runLocal(["write-csv", metadataTable(tableName)], msg + '\n');
+    });
+    this.localToServerSyncConnections[tableName] = newConn;
 
     const request: ProtoWrite = {
        request: "write",
        table: tableName,
     };
+    newConn.write(request)
+    newConn.expectingData()
 
-    const authMsg = await objThis.createAuthMsg(creds)
-    return new Promise((resolve, _reject) => {
-      let sessionId = session;
-      const socket = new WebSocket(uri);
-      const failureThresholdMs = 60000;
-      let failureTimeout: number|undefined = undefined;
-
-      const reconnect = (_event: Event) => {
-        socket.onmessage = null;
-        socket.onclose = null;
-        socket.onerror = null;
-        socket.close();
-        clearTimeout(failureTimeout);
-
-        const backoffMs = 500 + Math.random() * 1000;
-        setTimeout(() => {
-          objThis.connectWriteTable(uri, creds, tableName, suffix, sessionId);
-        }, backoffMs)
-      };
-
-      socket.onmessage = function (event) {
-        clearTimeout(failureTimeout);
-
-        const deliver = (data: ProtoData) => {
-          let msg = data.data;
-          if (msg != "") {
-            // we only expect acks back in the form of checkpoints.
-            // let's store these as a watermark against the table.
-            objThis.runLocal(["write-csv", tableName + suffix], msg + '\n');
-          }
-        };
-
-        const data = event.data;
-
-        if(typeof data === "string") {
-          deliver(JSON.parse(data))
-        } else {
-          const reader = new FileReader();
-          reader.addEventListener(
-            "load",
-            () => {
-              let msg = JSON.parse((reader.result || "") as string);
-              // we know it will be a string because we called readAsText
-              deliver(msg);
-            },
-            false
-          );
-          reader.readAsText(data);
-        }
-      };
-
-      socket.onclose = reconnect;
-      socket.onerror = reconnect;
-
-      const write = (data: string) => {
-        socket.send(JSON.stringify({
-          request: "pipe",
-          data: data,
-        }));
-        // we expect an ack within a reasonable amount of time
-        failureTimeout = setTimeout(reconnect, failureThresholdMs);
-      };
-
-      socket.onopen = function (_event) {
-        socket.send(JSON.stringify(authMsg));
-        socket.send(JSON.stringify(request));
-
-        if (!session) {
-          let fileName = tableName + "_" + creds.accessKey;
-          objThis.attach(change => {
-            write(change);
-          });
-          sessionId = objThis.runLocal(
-            [
-              "subscribe", tableName + suffix, "--connect", "--format=csv", "--updates", fileName
-            ],
-            ""
-          ).trim();
-        } else {
-          const diff = objThis.runLocal(
-            [
-              "diff", "--format=csv",
-              "--since", objThis.watermark(tableName + suffix).toString(),
-              session,
-            ], "");
-
-          write(diff);
-        }
-
-        resolve();
-      };
+    let fileName = tableName + "_" + creds.accessKey;
+    objThis.attach(change => {
+      newConn.write({
+        request: "pipe",
+        data: change,
+      });
+      newConn.expectingData();
     });
+    const session = objThis.runLocal(
+      [
+        "subscribe", tableName, "--connect", "--format=csv",
+        "--updates", fileName, "--ignore-source", objThis.replication_uid
+      ],
+      ""
+    ).trim();
+
+    newConn.onReconnect = () => {
+      newConn.write(request);
+
+      const diff = objThis.runLocal(
+        [
+          "diff", "--format=csv",
+          "--since", objThis.watermark(metadataTable(tableName)).toString(),
+          session,
+        ], "");
+
+      newConn.write({
+        request: "pipe",
+        data: diff,
+      });
+
+      newConn.expectingData();
+    }
   }
 
   getSessionID(tableName: string): number {
@@ -970,12 +1139,14 @@ export class SKDB {
     return this.runLocal(["dump-table", tableName], "");
   }
 
-  viewSchema(viewName: string, renameSuffix: string = ""): string {
+  viewSchema(viewName: string): string {
     return this.runLocal(["dump-view", viewName], "");
   }
 
   schema(): string {
-    return this.runLocal(["dump-tables"], "");
+    const tables = this.runLocal(["dump-tables"], "");
+    const views = this.runLocal(["dump-views"], "");
+    return tables + views;
   }
 
   insert(tableName: string, values: Array<any>): void {
@@ -1027,6 +1198,11 @@ class SKDBServer {
   private castData(response: ProtoResponse): ProtoData {
     if (response.request === "pipe") {
       return response;
+    }
+    if (response.request == "error") {
+      console.error(response.msg);
+    } else {
+      console.error("Unexpected response", response);
     }
     throw new Error(`Unexpected response: ${response}`);
   }
@@ -1080,42 +1256,28 @@ class SKDBServer {
   }
 
   async mirrorTable(tableName: string): Promise<void> {
-    let remoteSuffix = "_remote_" + this.serverID;
-    let createRemoteTable = await this.tableSchema(tableName, remoteSuffix);
-    this.client.runLocal([], createRemoteTable);
+    let createTable = await this.tableSchema(tableName, "");
 
-    let localSuffix = "_local";
-    let createLocalTable = await this.tableSchema(tableName, localSuffix);
-    this.client.runLocal([], createLocalTable);
+    this.client.runLocal([], createTable);
+    this.client.runLocal([],
+      `CREATE TABLE ${metadataTable(tableName)} (
+         key STRING PRIMARY KEY,
+         value STRING
+       )`);
 
     await this.client.connectWriteTable(
       this.uri,
       this.creds,
       tableName,
-      localSuffix
     );
 
     await this.client.connectReadTable(
       this.uri,
       this.creds,
       tableName,
-      remoteSuffix,
     );
 
     this.client.setMirroredTable(tableName, this.sessionID);
-
-    this.client.runLocal(
-      [],
-      "create virtual view " +
-        tableName +
-        " as select * from " +
-        tableName +
-        localSuffix +
-        " union select * from " +
-        tableName +
-        remoteSuffix +
-        ";"
-    );
   }
 
   async mirrorView(viewName: string, suffix?: string): Promise<void> {
@@ -1126,8 +1288,7 @@ class SKDBServer {
     await this.client.connectReadTable(
       this.uri,
       this.creds,
-      viewName,
-      suffix,
+      viewName + suffix,
     );
 
     this.client.setMirroredTable(viewName, this.sessionID);
