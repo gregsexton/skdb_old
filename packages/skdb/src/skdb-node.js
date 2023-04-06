@@ -254,6 +254,505 @@ class ResilientConnection {
     }
 }
 /* ***************************************************************************/
+/* Stream MUX protocol
+/* ***************************************************************************/
+var MuxedSocketState;
+(function (MuxedSocketState) {
+    MuxedSocketState[MuxedSocketState["IDLE"] = 0] = "IDLE";
+    MuxedSocketState[MuxedSocketState["AUTH_SENT"] = 1] = "AUTH_SENT";
+    MuxedSocketState[MuxedSocketState["CLOSING"] = 2] = "CLOSING";
+    MuxedSocketState[MuxedSocketState["CLOSEWAIT"] = 3] = "CLOSEWAIT";
+    MuxedSocketState[MuxedSocketState["CLOSED"] = 4] = "CLOSED";
+})(MuxedSocketState || (MuxedSocketState = {}));
+export class MuxedSocket {
+    constructor(socket) {
+        // state
+        this.state = MuxedSocketState.IDLE;
+        // streams in the open or closing state
+        this.activeStreams = new Map();
+        this.serverStreamWatermark = 0;
+        this.nextStream = 1;
+        // pre-condition: socket is open
+        this.socket = socket;
+    }
+    openStream() {
+        switch (this.state) {
+            case MuxedSocketState.AUTH_SENT: {
+                const streamId = this.nextStream;
+                this.nextStream = this.nextStream + 2; // client uses odd-numbered streams
+                const stream = new Stream(this, streamId);
+                this.activeStreams.set(streamId, stream);
+                return stream;
+            }
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSEWAIT:
+                throw new Error("Connection closing");
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.CLOSED:
+                throw new Error("Connection not established");
+        }
+    }
+    closeSocket() {
+        switch (this.state) {
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSED:
+                break;
+            case MuxedSocketState.IDLE:
+                this.activeStreams.clear();
+                this.state = MuxedSocketState.CLOSED;
+                this.socket.close();
+                break;
+            case MuxedSocketState.CLOSEWAIT: {
+                for (const stream of this.activeStreams.values()) {
+                    stream.close();
+                }
+                this.activeStreams.clear();
+                this.state = MuxedSocketState.CLOSED;
+                this.socket.close();
+                break;
+            }
+            case MuxedSocketState.AUTH_SENT: {
+                for (const stream of this.activeStreams.values()) {
+                    stream.close();
+                }
+                this.state = MuxedSocketState.CLOSING;
+                this.socket.close();
+                break;
+            }
+        }
+    }
+    errorSocket(errorCode, msg) {
+        switch (this.state) {
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSED:
+                this.activeStreams.clear();
+                this.state = MuxedSocketState.CLOSED;
+                break;
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSEWAIT: {
+                for (const stream of this.activeStreams.values()) {
+                    stream.error(errorCode, msg);
+                }
+                this.activeStreams.clear();
+                this.state = MuxedSocketState.CLOSED;
+                const lastStream = Math.max(this.nextStream - 2, this.serverStreamWatermark);
+                this.socket.send(this.encodeGoawayMsg(lastStream, errorCode, msg));
+                this.socket.close(1002);
+                break;
+            }
+        }
+    }
+    static async connect(uri, creds) {
+        const auth = await MuxedSocket.encodeAuthMsg(creds);
+        return new Promise((resolve, reject) => {
+            const socket = new WebSocket(uri);
+            socket.binaryType = "arraybuffer";
+            socket.onclose = (_event) => reject(new Error("Socket closed before open"));
+            socket.onerror = (event) => reject(event);
+            socket.onmessage = (_event) => reject(new Error("Socket messaged before open"));
+            socket.onopen = (_event) => {
+                const muxSocket = new MuxedSocket(socket);
+                socket.onclose = (event) => muxSocket.onSocketClose(event);
+                socket.onerror = (_event) => muxSocket.onSocketError(0, "socket error");
+                socket.onmessage = (event) => muxSocket.onSocketMessage(event);
+                resolve(muxSocket);
+                muxSocket.sendAuth(auth);
+            };
+        });
+    }
+    // interface used by Stream //////////////////////////////////////////////////
+    streamClose(stream, nowClosed) {
+        switch (this.state) {
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSED:
+                break;
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSEWAIT: {
+                this.socket.send(this.encodeStreamCloseMsg(stream));
+                if (nowClosed) {
+                    this.activeStreams.delete(stream);
+                }
+                break;
+            }
+        }
+    }
+    streamError(stream, errorCode, msg) {
+        switch (this.state) {
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSED:
+                break;
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSEWAIT:
+                this.socket.send(this.encodeStreamResetMsg(stream, errorCode, msg));
+                this.activeStreams.delete(stream);
+                break;
+        }
+    }
+    streamSend(stream, data) {
+        switch (this.state) {
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSED:
+                break;
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSEWAIT:
+                this.socket.send(this.encodeStreamDataMsg(stream, data));
+        }
+    }
+    // private ///////////////////////////////////////////////////////////////////
+    onSocketClose(_event) {
+        switch (this.state) {
+            case MuxedSocketState.CLOSEWAIT:
+            case MuxedSocketState.CLOSED:
+                break;
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.AUTH_SENT:
+                for (const stream of this.activeStreams.values()) {
+                    stream.onStreamClose();
+                }
+                if (this.onClose) {
+                    this.onClose();
+                }
+                this.state = MuxedSocketState.CLOSEWAIT;
+                break;
+            case MuxedSocketState.CLOSING:
+                for (const stream of this.activeStreams.values()) {
+                    stream.onStreamClose();
+                }
+                if (this.onClose) {
+                    this.onClose();
+                }
+                this.activeStreams.clear();
+                this.state = MuxedSocketState.CLOSED;
+                break;
+        }
+    }
+    onSocketError(errorCode, msg) {
+        switch (this.state) {
+            case MuxedSocketState.CLOSED:
+                break;
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSEWAIT:
+                for (const stream of this.activeStreams.values()) {
+                    stream.onStreamError(0, msg);
+                }
+                if (this.onError) {
+                    this.onError(errorCode, msg);
+                }
+                this.activeStreams.clear();
+                this.state = MuxedSocketState.CLOSED;
+        }
+    }
+    onSocketMessage(event) {
+        switch (this.state) {
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSING:
+                if (!(event.data instanceof ArrayBuffer)) {
+                    throw new Error("Received unexpected text data");
+                }
+                const msg = this.decode(event.data);
+                if (msg === null) {
+                    // for robustness we ignore messages we don't understand
+                    return;
+                }
+                switch (msg.type) {
+                    case "auth":
+                        throw new Error("Unexepected auth message from server");
+                    case "goaway":
+                        this.onSocketError(msg.errorCode, msg.msg);
+                        break;
+                    case "data": {
+                        let stream = this.activeStreams.get(msg.stream);
+                        if (stream == undefined && this.state == MuxedSocketState.CLOSING) {
+                            // we don't accept new streams while closing
+                            break;
+                        }
+                        // TODO: is the watermark condition necesary? we don't want to
+                        // reuse streams but this doesn't allow for creating them with
+                        // non-deterministic scheduling. if we don't accept them,
+                        // should probably send a stream reset
+                        if (stream === undefined && msg.stream % 2 == 0 && msg.stream > this.serverStreamWatermark) {
+                            // new server-initiated stream
+                            this.serverStreamWatermark = msg.stream;
+                            stream = new Stream(this, msg.stream);
+                            this.activeStreams.set(msg.stream, stream);
+                            if (this.onStream) {
+                                this.onStream(stream);
+                            }
+                        }
+                        stream?.onStreamData(msg.payload);
+                        break;
+                    }
+                    case "close":
+                        const closed = this.activeStreams.get(msg.stream)?.onStreamClose();
+                        if (closed) {
+                            this.activeStreams.delete(msg.stream);
+                        }
+                        break;
+                    case "reset":
+                        this.activeStreams.get(msg.stream)?.onStreamError(msg.errorCode, msg.msg);
+                        this.activeStreams.delete(msg.stream);
+                        break;
+                    default:
+                        throw new Error("Unexpected message type");
+                }
+                break;
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.CLOSEWAIT:
+            case MuxedSocketState.CLOSED:
+                break;
+        }
+    }
+    sendAuth(msg) {
+        switch (this.state) {
+            case MuxedSocketState.IDLE:
+                this.state = MuxedSocketState.AUTH_SENT;
+                this.socket.send(msg);
+                break;
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSING:
+                throw new Error("Tried to auth an established connection");
+            case MuxedSocketState.CLOSEWAIT:
+            case MuxedSocketState.CLOSED:
+                break;
+        }
+    }
+    static async encodeAuthMsg(creds) {
+        const enc = new TextEncoder();
+        const buf = new ArrayBuffer(96);
+        const uint8View = new Uint8Array(buf);
+        const dataView = new DataView(buf);
+        const now = (new Date()).toISOString();
+        const nonce = uint8View.subarray(28, 36);
+        crypto.getRandomValues(nonce);
+        const b64nonce = btoa(String.fromCharCode(...nonce));
+        const bytesToSign = enc.encode("auth" + creds.accessKey + now + b64nonce);
+        const sig = await crypto.subtle.sign("HMAC", creds.privateKey, bytesToSign);
+        dataView.setUint8(0, 0x0); // type
+        dataView.setUint8(4, 0x0); // version
+        const encodeAccessKey = enc.encodeInto(creds.accessKey, uint8View.subarray(8));
+        if (encodeAccessKey.written != 20) {
+            throw new Error("Unable to encode access key");
+        }
+        uint8View.set(new Uint8Array(sig), 36);
+        const encodeIsoDate = enc.encodeInto(now, uint8View.subarray(69));
+        switch (encodeIsoDate.written) {
+            case 24:
+                return buf.slice(0, 93);
+            case 27:
+                dataView.setUint8(68, 0x1);
+                return buf;
+            default:
+                throw new Error("Unexpected ISO date length");
+        }
+    }
+    encodeGoawayMsg(lastStream, errorCode, msg) {
+        if (lastStream >= 2 ** 24) {
+            throw new Error("Cannot encode lastStream");
+        }
+        const buf = new ArrayBuffer(16 + msg.length * 3); // avoid resizing
+        const uint8View = new Uint8Array(buf);
+        const textEncoder = new TextEncoder();
+        const encodeResult = textEncoder.encodeInto(msg, uint8View.subarray(16));
+        const dataView = new DataView(buf);
+        dataView.setUint8(0, 0x1); // type
+        dataView.setUint32(4, lastStream, false);
+        dataView.setUint32(8, errorCode, false);
+        dataView.setUint32(12, encodeResult.written || 0, false);
+        return buf.slice(0, 16 + (encodeResult.written || 0));
+    }
+    encodeStreamDataMsg(stream, data) {
+        if (stream >= 2 ** 24) {
+            throw new Error("Cannot encode stream");
+        }
+        const buf = new ArrayBuffer(4 + data.byteLength);
+        const dataView = new DataView(buf);
+        const uint8View = new Uint8Array(buf);
+        dataView.setUint32(0, 0x2 << 24 | stream, false); // type and stream id
+        uint8View.set(new Uint8Array(data), 4);
+        return buf;
+    }
+    encodeStreamCloseMsg(stream) {
+        if (stream >= 2 ** 24) {
+            throw new Error("Cannot encode stream");
+        }
+        const buf = new ArrayBuffer(4);
+        const dataView = new DataView(buf);
+        dataView.setUint32(0, 0x3 << 24 | stream, false); // type and stream id
+        return buf;
+    }
+    encodeStreamResetMsg(stream, errorCode, msg) {
+        if (stream >= 2 ** 24) {
+            throw new Error("Cannot encode stream");
+        }
+        const textEncoder = new TextEncoder();
+        const buf = new ArrayBuffer(12 + msg.length * 3); // avoid resizing
+        const uint8View = new Uint8Array(buf);
+        const dataView = new DataView(buf);
+        dataView.setUint32(0, 0x4 << 24 | stream, false); // type and stream id
+        dataView.setUint32(4, errorCode, false);
+        const encodeResult = textEncoder.encodeInto(msg, uint8View.subarray(12));
+        dataView.setUint32(8, encodeResult.written || 0, false);
+        return buf.slice(0, 12 + (encodeResult.written || 0));
+    }
+    decode(msg) {
+        const dv = new DataView(msg);
+        const typeAndStream = dv.getUint32(0, false);
+        const type = typeAndStream >>> 24;
+        const stream = typeAndStream & 0xFFFFFF;
+        switch (type) {
+            case 0: { // auth
+                return {
+                    type: "auth",
+                };
+            }
+            case 1: { // goaway
+                const msgLength = dv.getUint32(12, false);
+                const errorMsgBytes = new Uint8Array(msg, 16, msgLength);
+                const td = new TextDecoder();
+                const errorMsg = td.decode(errorMsgBytes);
+                return {
+                    type: "goaway",
+                    lastStream: dv.getUint32(4, false),
+                    errorCode: dv.getUint32(8, false),
+                    msg: errorMsg,
+                };
+            }
+            case 2: { // stream data
+                return {
+                    type: "data",
+                    stream: stream,
+                    payload: new Uint8Array(msg, 4),
+                };
+            }
+            case 3: { // stream close
+                return {
+                    type: "close",
+                    stream: stream,
+                };
+            }
+            case 4: { // stream reset
+                const msgLength = dv.getUint32(8, false);
+                const errorMsgBytes = new Uint8Array(msg, 12, msgLength);
+                const td = new TextDecoder();
+                const errorMsg = td.decode(errorMsgBytes);
+                return {
+                    type: "reset",
+                    stream: stream,
+                    errorCode: dv.getUint32(4, false),
+                    msg: errorMsg,
+                };
+            }
+            default:
+                return null;
+        }
+    }
+}
+var StreamState;
+(function (StreamState) {
+    StreamState[StreamState["OPEN"] = 0] = "OPEN";
+    StreamState[StreamState["CLOSING"] = 1] = "CLOSING";
+    StreamState[StreamState["CLOSEWAIT"] = 2] = "CLOSEWAIT";
+    StreamState[StreamState["CLOSED"] = 3] = "CLOSED";
+})(StreamState || (StreamState = {}));
+class Stream {
+    close() {
+        switch (this.state) {
+            case StreamState.CLOSING:
+            case StreamState.CLOSED:
+                break;
+            case StreamState.OPEN:
+                this.state = StreamState.CLOSING;
+                this.socket.streamClose(this.streamId, false);
+                break;
+            case StreamState.CLOSEWAIT:
+                this.state = StreamState.CLOSED;
+                this.socket.streamClose(this.streamId, true);
+                break;
+        }
+    }
+    error(errorCode, msg) {
+        switch (this.state) {
+            case StreamState.CLOSED:
+            case StreamState.CLOSING:
+                this.state = StreamState.CLOSED;
+                break;
+            case StreamState.OPEN:
+            case StreamState.CLOSEWAIT:
+                this.state = StreamState.CLOSED;
+                this.socket.streamError(this.streamId, errorCode, msg);
+                break;
+        }
+    }
+    send(data) {
+        switch (this.state) {
+            case StreamState.CLOSING:
+            case StreamState.CLOSED:
+                break;
+            case StreamState.OPEN:
+            case StreamState.CLOSEWAIT:
+                this.socket.streamSend(this.streamId, data);
+        }
+    }
+    // interface used by MuxedSocket ///////////////////////////
+    constructor(socket, streamId) {
+        // state
+        this.state = StreamState.OPEN;
+        this.socket = socket;
+        this.streamId = streamId;
+    }
+    onStreamClose() {
+        switch (this.state) {
+            case StreamState.CLOSED:
+                return true;
+            case StreamState.CLOSEWAIT:
+                return false;
+            case StreamState.OPEN:
+                this.state = StreamState.CLOSEWAIT;
+                if (this.onClose) {
+                    this.onClose();
+                }
+                return false;
+            case StreamState.CLOSING:
+                this.state = StreamState.CLOSED;
+                if (this.onClose) {
+                    this.onClose();
+                }
+                return true;
+        }
+    }
+    onStreamError(errorCode, msg) {
+        switch (this.state) {
+            case StreamState.CLOSED:
+                break;
+            case StreamState.CLOSING:
+            case StreamState.OPEN:
+            case StreamState.CLOSEWAIT:
+                this.state = StreamState.CLOSED;
+                if (this.onError) {
+                    this.onError(errorCode, msg);
+                }
+        }
+    }
+    onStreamData(data) {
+        switch (this.state) {
+            case StreamState.CLOSED:
+            case StreamState.CLOSEWAIT:
+                break;
+            case StreamState.CLOSING:
+            case StreamState.OPEN:
+                if (this.onData) {
+                    this.onData(data);
+                }
+        }
+    }
+}
+/* ***************************************************************************/
 /* A few primitives to encode/decode utf8. */
 /* ***************************************************************************/
 function encodeUTF8(exports, s) {
@@ -425,8 +924,19 @@ export class SKDB {
     setMirroredTable(tableName, sessionID) {
         this.mirroredTables[tableName] = sessionID;
     }
-    attach(f) {
-        this.execOnChange[this.fileDescrNbr] = f;
+    openFile(filename) {
+        if (this.fileDescrs[filename] !== undefined) {
+            return this.fileDescrs[filename];
+        }
+        let fd = this.fileDescrNbr;
+        this.files[fd] = new Array();
+        this.fileDescrs[filename] = fd;
+        this.fileDescrNbr++;
+        return fd;
+    }
+    watchFile(filename, f) {
+        const fd = this.openFile(filename);
+        this.execOnChange[fd] = f;
     }
     async connect(db, accessKey, privateKey, endpoint) {
         if (!endpoint) {
@@ -536,14 +1046,7 @@ export class SKDB {
             },
             SKIP_unix_open: function (wasmFilename) {
                 let filename = wasmStringToJS(data.exports, wasmFilename);
-                if (data.fileDescrs[filename] !== undefined) {
-                    return data.fileDescrs[filename];
-                }
-                let fd = data.fileDescrNbr;
-                data.files[fd] = new Array();
-                data.fileDescrs[filename] = fd;
-                data.fileDescrNbr++;
-                return fd;
+                return data.openFile(filename);
             },
             SKIP_write_to_file: function (fd, str) {
                 let jsStr = wasmStringToJS(data.exports, str);
@@ -656,7 +1159,8 @@ export class SKDB {
     }
     runSubscribeRoots(reboot) {
         this.roots = new Map();
-        this.attach((text) => {
+        let fileName = "/subscriptions/jsroots";
+        this.watchFile(fileName, (text) => {
             let changed = new Map();
             let updates = text.split("\n").filter((x) => x.indexOf("\t") != -1);
             for (const update of updates) {
@@ -680,7 +1184,6 @@ export class SKDB {
             }
         });
         this.subscriptionCount++;
-        let fileName = "/subscriptions/jsroots";
         if (reboot) {
             this.runLocal(["subscribe", "jsroots", "--format=json", "--updates", fileName], "");
         }
@@ -754,7 +1257,10 @@ export class SKDB {
         newConn.write(request);
         newConn.expectingData();
         let fileName = tableName + "_" + creds.accessKey;
-        objThis.attach(change => {
+        objThis.watchFile(fileName, change => {
+            if (change == "") {
+                return;
+            }
             newConn.write({
                 request: "pipe",
                 data: change,
@@ -772,6 +1278,9 @@ export class SKDB {
                 "--since", objThis.watermark(metadataTable(tableName)).toString(),
                 session,
             ], "");
+            if (diff == "") {
+                return;
+            }
             newConn.write({
                 request: "pipe",
                 data: diff,
@@ -818,8 +1327,8 @@ export class SKDB {
         return this.roots.get(rootName);
     }
     subscribe(viewName, f) {
-        this.attach(f);
-        let fileName = "/subscriptions/sub" + this.subscriptionCount;
+        const fileName = "/subscriptions/sub" + this.subscriptionCount;
+        this.watchFile(fileName, f);
         this.subscriptionCount++;
         this.runLocal(["subscribe", viewName, "--format=csv", "--updates", fileName], "");
     }
@@ -832,8 +1341,14 @@ export class SKDB {
             .filter((x) => x != "")
             .map((x) => JSON.parse(x));
     }
+    tableExists(tableName) {
+        return this.runLocal(["dump-table", tableName], "").trim() != "";
+    }
     tableSchema(tableName) {
         return this.runLocal(["dump-table", tableName], "");
+    }
+    viewExists(viewName) {
+        return this.runLocal(["dump-view", viewName], "") != "";
     }
     viewSchema(viewName) {
         return this.runLocal(["dump-view", viewName], "");
@@ -926,20 +1441,25 @@ class SKDBServer {
         return this.castData(resp).data;
     }
     async mirrorTable(tableName) {
-        let createTable = await this.tableSchema(tableName, "");
-        this.client.runLocal([], createTable);
-        this.client.runLocal([], `CREATE TABLE ${metadataTable(tableName)} (
+        // TODO: just assumes that if it exists the schema is the same
+        if (!this.client.tableExists(tableName)) {
+            let createTable = await this.tableSchema(tableName, "");
+            this.client.runLocal([], createTable);
+            this.client.runLocal([], `CREATE TABLE ${metadataTable(tableName)} (
          key STRING PRIMARY KEY,
          value STRING
        )`);
+        }
         await this.client.connectWriteTable(this.uri, this.creds, tableName);
         await this.client.connectReadTable(this.uri, this.creds, tableName);
         this.client.setMirroredTable(tableName, this.sessionID);
     }
     async mirrorView(viewName, suffix) {
-        suffix = suffix || "";
-        let createRemoteTable = await this.viewSchema(viewName, suffix);
-        this.client.runLocal([], createRemoteTable);
+        if (!this.client.viewExists(viewName + suffix)) {
+            suffix = suffix || "";
+            let createRemoteTable = await this.viewSchema(viewName, suffix);
+            this.client.runLocal([], createRemoteTable);
+        }
         await this.client.connectReadTable(this.uri, this.creds, viewName + suffix);
         this.client.setMirroredTable(viewName, this.sessionID);
     }
