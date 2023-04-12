@@ -868,6 +868,7 @@ export class SKDB {
         this.current_stdin = 0;
         this.stdin = "";
         this.stdout = new Array();
+        this.stdout_objects = new Array();
         this.onRootChangeFuns = new Array();
         this.externalFuns = [];
         this.fileDescrs = new Map();
@@ -973,6 +974,9 @@ export class SKDB {
     }
     makeWasmImports() {
         let data = this;
+        let field_names = new Array();
+        let objectIdx = 0;
+        let object = {};
         return {
             abort: function (err) {
                 throw new Error("abort " + err);
@@ -1034,6 +1038,44 @@ export class SKDB {
                 let result = data.stdin.charCodeAt(data.current_stdin);
                 data.current_stdin++;
                 return result;
+            },
+            SKIP_clear_field_names: function () {
+                field_names = new Array();
+            },
+            SKIP_push_field_name: function (str) {
+                field_names.push(wasmStringToJS(data.exports, str));
+            },
+            SKIP_clear_object: function () {
+                objectIdx = 0;
+                object = {};
+            },
+            SKIP_push_object_field_null: function () {
+                let field_name = field_names[objectIdx];
+                object[field_name] = null;
+                objectIdx++;
+            },
+            SKIP_push_object_field_int32: function (n) {
+                let field_name = field_names[objectIdx];
+                object[field_name] = n;
+                objectIdx++;
+            },
+            SKIP_push_object_field_int64: function (str) {
+                let field_name = field_names[objectIdx];
+                object[field_name] = parseInt(wasmStringToJS(data.exports, str), 10);
+                objectIdx++;
+            },
+            SKIP_push_object_field_float: function (str) {
+                let field_name = field_names[objectIdx];
+                object[field_name] = parseFloat(wasmStringToJS(data.exports, str));
+                objectIdx++;
+            },
+            SKIP_push_object_field_string: function (str) {
+                let field_name = field_names[objectIdx];
+                object[field_name] = wasmStringToJS(data.exports, str);
+                objectIdx++;
+            },
+            SKIP_push_object: function () {
+                data.stdout_objects.push(object);
             },
             SKIP_print_raw: function (str) {
                 data.stdout.push(wasmStringToJS(data.exports, str));
@@ -1336,10 +1378,13 @@ export class SKDB {
         return this.runLocal([], stdin);
     }
     sql(stdin) {
-        return this.runLocal(["--format=json"], stdin)
-            .split("\n")
-            .filter((x) => x != "")
-            .map((x) => JSON.parse(x));
+        let stdout = this.runLocal(["--format=js"], stdin);
+        if (stdout == "") {
+            let result = this.stdout_objects;
+            this.stdout_objects = new Array();
+            return result;
+        }
+        return stdout;
     }
     tableExists(tableName) {
         return this.runLocal(["dump-table", tableName], "").trim() != "";
