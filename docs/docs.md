@@ -52,7 +52,7 @@ become read-only. If you need a larger capacity, you can use the option '--capac
 
 Let's first load some mock data to play with the database.
 
-```$ wget https://github.com/SkipLabs/skdb/raw/main/example/tiny_TPCH.sql
+```$ wget https://github.com/SkipLabs/skdb/raw/main/docs/tiny_TPCH.sql
 $ cat tiny_TPCH.sql | skdb --data /tmp/test.db
 ```
 
