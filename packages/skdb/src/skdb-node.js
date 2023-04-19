@@ -920,6 +920,8 @@ export class SKDB {
         client.runSubscribeRoots(reboot);
         client.replication_uid = client.runLocal(["uid"], "").trim();
         client.client_uuid = crypto.randomUUID();
+        // flush to disk on a poll - TODO: short-term perf workaround
+        client.persistTimer = setInterval(() => client.storePagesLoop(), 10000);
         return client;
     }
     setMirroredTable(tableName, sessionID) {
@@ -1196,7 +1198,6 @@ export class SKDB {
                 this.dirtyPages.push(dirtyPage);
             }
         }
-        this.storePagesLoop();
         return this.stdout.join("");
     }
     runSubscribeRoots(reboot) {
