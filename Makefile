@@ -1,6 +1,7 @@
 .PHONY: npm
 npm: clean
 	tsc --build tsconfig.all.json
+	./inlineWasm.sh
 	chmod +x packages/skdb/dist/skdb-cli.js
 
 .PHONY: clean
