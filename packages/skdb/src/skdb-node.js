@@ -6,22 +6,10 @@ import { WebSocket } from 'ws';
 /* ***************************************************************************/
 /* WASM Loading. */
 /* ***************************************************************************/
-// for distribution we replace this line with inlined base64-encoded bytes
-const wasmBase64 = "";
-async function getWasmSource() {
-    if (wasmBase64 === "") {
-        
-        let wasmBuffer = fs.readFileSync("skdb.wasm");
-        return new Uint8Array(wasmBuffer);
-    }
-    // @ts-ignore
+export async function fetchWasmSource() {
+    
     let wasmBuffer = fs.readFileSync("skdb.wasm");
-    let len = wasmBuffer.length;
-    let typedArray = new Uint8Array(len);
-    for (var i = 0; i < len; i++) {
-        typedArray[i] = wasmBuffer.charCodeAt(i);
-    }
-    return typedArray;
+    return new Uint8Array(wasmBuffer);
 }
 /* ***************************************************************************/
 /* Primitives to connect to indexedDB. */
@@ -252,7 +240,7 @@ export class SKDB {
     static async clear(dbName, storeName) {
         await clearSKDBStore(dbName, storeName);
     }
-    static async create(dbName = null) {
+    static async create(dbName = null, getWasmSource) {
         let storeName = null;
         if (dbName != null) {
             storeName = "SKDBStore";
@@ -261,7 +249,10 @@ export class SKDB {
         let pageBitSize = 20;
         client.pageSize = 1 << pageBitSize;
         let env = client.makeWasmImports();
-        const wasmBytes = await getWasmSource();
+        // NOTE `skdb-wasm-b64` is imported dynamically to avoid bundling
+        // the wasm in the same file.
+        const getWasmSource_ = getWasmSource ?? (() => import('./skdb-wasm-b64.js').then((mod) => mod.getWasmSource()));
+        const wasmBytes = await getWasmSource_();
         let wasm = await WebAssembly.instantiate(wasmBytes, { env: env });
         let exports = wasm.instance.exports;
         client.exports = exports;
@@ -600,10 +591,10 @@ export class SKDB {
         return this.runLocal([], stdin);
     }
     sql(stdin) {
+        this.stdout_objects = new Array();
         let stdout = this.runLocal(["--format=js"], stdin);
         if (stdout == "") {
             let result = this.stdout_objects;
-            this.stdout_objects = new Array();
             return result;
         }
         return stdout;
