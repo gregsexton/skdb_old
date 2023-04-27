@@ -3,7 +3,7 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 cd "$SCRIPT_DIR" || exit 1
 
-SOURCE=packages/skdb/dist/skdb-browser.js
+SOURCE=packages/skdb/dist/skdb-wasm-b64.js
 WASM=packages/skdb/skdb.wasm
 TMP=$(mktemp /tmp/SRC.XXXXXX)
 
