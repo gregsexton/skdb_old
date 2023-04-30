@@ -144,50 +144,15 @@ function encodeUTF8(exports, s) {
     }
     return exports.sk_string_create(addr, i);
 }
+function encodeUTF8Str(text) {
+    const encoder = new TextEncoder();
+    return encoder.encode(text);
+}
 function decodeUTF8(bytes) {
-    let i = 0, s = "";
-    while (i < bytes.length) {
-        let c = bytes[i++];
-        if (c > 127) {
-            if (c > 191 && c < 224) {
-                if (i >= bytes.length)
-                    throw new Error("UTF-8 decode: incomplete 2-byte sequence");
-                c = ((c & 31) << 6) | (bytes[i++] & 63);
-            }
-            else if (c > 223 && c < 240) {
-                if (i + 1 >= bytes.length)
-                    throw new Error("UTF-8 decode: incomplete 3-byte sequence");
-                c = ((c & 15) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63);
-            }
-            else if (c > 239 && c < 248) {
-                if (i + 2 >= bytes.length)
-                    throw new Error("UTF-8 decode: incomplete 4-byte sequence");
-                c =
-                    ((c & 7) << 18) |
-                        ((bytes[i++] & 63) << 12) |
-                        ((bytes[i++] & 63) << 6) |
-                        (bytes[i++] & 63);
-            }
-            else
-                throw new Error("UTF-8 decode: unknown multibyte start 0x" +
-                    c.toString(16) +
-                    " at index " +
-                    (i - 1));
-        }
-        if (c <= 0xffff)
-            s += String.fromCharCode(c);
-        else if (c <= 0x10ffff) {
-            c -= 0x10000;
-            s += String.fromCharCode((c >> 10) | 0xd800);
-            s += String.fromCharCode((c & 0x3ff) | 0xdc00);
-        }
-        else
-            throw new Error("UTF-8 decode: code point 0x" + c.toString(16) + " exceeds UTF-16 reach");
-    }
-    return s;
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    return decoder.decode(bytes);
 }
 function wasmStringToJS(exports, wasmPointer) {
-    let data32 = new Uint32Array(exports.memory.buffer);
     let size = exports["SKIP_String_byteSize"](wasmPointer);
     let data = new Uint8Array(exports.memory.buffer);
     return decodeUTF8(data.slice(wasmPointer, wasmPointer + size));
@@ -212,6 +177,9 @@ class SKDBCallable {
 /* ***************************************************************************/
 /* The local database. */
 /* ***************************************************************************/
+function metadataTable(tableName) {
+    return `skdb__${tableName}_sync_metadata`;
+}
 export class SKDB {
     constructor(storeName) {
         this.subscriptionCount = 0;
@@ -544,7 +512,7 @@ export class SKDB {
         }
     }
     watermark(table) {
-        return parseInt(this.runLocal(["watermark", table], ""));
+        return BigInt(this.runLocal(["watermark", table], ""));
     }
     cmd(new_args, new_stdin) {
         return this.runLocal(new_args, new_stdin);
@@ -630,8 +598,181 @@ export class SKDB {
         this.runLocal([], stdin);
     }
 }
-function metadataTable(tableName) {
-    return `skdb__${tableName}_sync_metadata`;
+function encodeProtoMsg(msg) {
+    switch (msg.type) {
+        case "query": {
+            const buf = new ArrayBuffer(6 + msg.query.length * 3);
+            const uint8View = new Uint8Array(buf);
+            const dataView = new DataView(buf);
+            const textEncoder = new TextEncoder();
+            const encodeResult = textEncoder.encodeInto(msg.query, uint8View.subarray(6));
+            dataView.setUint8(0, 0x1); // type
+            const formatLookup = new Map([
+                ["json", 0x0],
+                ["raw", 0x1],
+                ["csv", 0x2],
+            ]);
+            const format = formatLookup.get(msg.format);
+            if (format === undefined) {
+                throw new Error(`Cannot serialize format ${msg.format}`);
+            }
+            dataView.setUint8(1, format);
+            dataView.setUint32(2, encodeResult.written || 0, false);
+            return buf.slice(0, 6 + (encodeResult.written || 0));
+        }
+        case "schema": {
+            const name = msg.name || "";
+            const buf = new ArrayBuffer(4 + name.length * 3);
+            const uint8View = new Uint8Array(buf);
+            const dataView = new DataView(buf);
+            const textEncoder = new TextEncoder();
+            const encodeResult = textEncoder.encodeInto(name, uint8View.subarray(4));
+            dataView.setUint8(0, 0x4); // type
+            const scopeLookup = new Map([
+                ["all", 0x0],
+                ["table", 0x1],
+                ["view", 0x2],
+            ]);
+            const scope = scopeLookup.get(msg.scope);
+            if (scope === undefined) {
+                throw new Error(`Cannot serialize scope ${msg.scope}`);
+            }
+            dataView.setUint8(1, scope);
+            dataView.setUint16(2, encodeResult.written || 0, false);
+            return buf.slice(0, 4 + (encodeResult.written || 0));
+        }
+        case "tail": {
+            const buf = new ArrayBuffer(14 + msg.table.length * 3);
+            const uint8View = new Uint8Array(buf);
+            const dataView = new DataView(buf);
+            const textEncoder = new TextEncoder();
+            const encodeResult = textEncoder.encodeInto(msg.table, uint8View.subarray(14));
+            dataView.setUint8(0, 0x2); // type
+            dataView.setBigUint64(4, msg.since, false);
+            dataView.setUint16(12, encodeResult.written || 0, false);
+            return buf.slice(0, 14 + (encodeResult.written || 0));
+        }
+        case "pushPromise": {
+            const buf = new ArrayBuffer(6 + msg.table.length * 3);
+            const uint8View = new Uint8Array(buf);
+            const dataView = new DataView(buf);
+            const textEncoder = new TextEncoder();
+            const encodeResult = textEncoder.encodeInto(msg.table, uint8View.subarray(6));
+            dataView.setUint8(0, 0x3); // type
+            dataView.setUint16(4, encodeResult.written || 0, false);
+            return buf.slice(0, 6 + (encodeResult.written || 0));
+        }
+        case "createDatabase": {
+            const buf = new ArrayBuffer(3 + msg.name.length * 3);
+            const uint8View = new Uint8Array(buf);
+            const dataView = new DataView(buf);
+            const textEncoder = new TextEncoder();
+            const encodeResult = textEncoder.encodeInto(msg.name, uint8View.subarray(3));
+            dataView.setUint8(0, 0x5); // type
+            dataView.setUint16(1, encodeResult.written || 0, false);
+            return buf.slice(0, 3 + (encodeResult.written || 0));
+        }
+        case "createUser": {
+            const buf = new ArrayBuffer(1);
+            const dataView = new DataView(buf);
+            dataView.setUint8(0, 0x6); // type
+            return buf;
+        }
+        case "credentials": {
+            throw new Error("Encoding credentials unsupported");
+        }
+        case "data": {
+            const buf = new ArrayBuffer(2 + msg.payload.byteLength);
+            const uint8View = new Uint8Array(buf);
+            const dataView = new DataView(buf);
+            dataView.setUint8(0, 0x0); // type
+            // fin flag always set - we currently assume that JS doesn't stream chunks
+            dataView.setUint8(1, 0x1);
+            uint8View.set(new Uint8Array(msg.payload), 2);
+            return buf;
+        }
+    }
+}
+class ProtoMsgDecoder {
+    constructor() {
+        this.bufs = [];
+        this.msgs = [];
+    }
+    popBufs() {
+        if (this.bufs.length == 1) {
+            // avoid copying for the common case of single buffer
+            const buf = this.bufs.pop();
+            if (!buf) {
+                throw new Error("invariant violation");
+            }
+            return buf;
+        }
+        let bytes = 0;
+        for (const buf of this.bufs) {
+            bytes += buf.byteLength;
+        }
+        const acc = new ArrayBuffer(bytes);
+        const uint8View = new Uint8Array(acc);
+        let offset = 0;
+        for (const buf of this.bufs) {
+            uint8View.set(buf, offset);
+            offset += buf.byteLength;
+        }
+        this.bufs = [];
+        return acc;
+    }
+    // like a stack machine, you push bytes in until the machine pops
+    // them all, turns them in to a msg, and pushes this on to the stack
+    // to be popped. push returns true when a new msg is ready to be
+    // popped.
+    push(msg) {
+        const dv = new DataView(msg);
+        const type = dv.getUint8(0);
+        switch (type) {
+            // credentials response
+            case 0x80: {
+                const accessKeyFixedWidthBytes = new Uint8Array(msg, 1, 20);
+                // access key is a fixed-width but potentially zero-terminated string
+                const zeroIndex = accessKeyFixedWidthBytes.findIndex((x) => x == 0);
+                const accessKeyBytes = accessKeyFixedWidthBytes.slice(0, zeroIndex < 0 ? 20 : zeroIndex);
+                const decoder = new TextDecoder();
+                const accessKey = decoder.decode(accessKeyBytes);
+                this.msgs.push({
+                    type: "credentials",
+                    accessKey: accessKey,
+                    privateKey: new Uint8Array(msg, 21, 32),
+                });
+                return true;
+            }
+            // streaming data
+            case 0x0: {
+                const flags = dv.getUint8(1);
+                const fin = (flags & 0x01) === 1;
+                this.bufs.push(new Uint8Array(msg, 2));
+                if (fin) {
+                    this.msgs.push({
+                        type: "data",
+                        payload: this.popBufs(),
+                    });
+                    return true;
+                }
+                return false;
+            }
+            default: {
+                this.msgs.push(null);
+                return true;
+            }
+        }
+    }
+    // returns the last message assembled and clears it off the stack.
+    // null represents a message from a future schema that we don't understand
+    pop() {
+        const msg = this.msgs.pop();
+        if (msg === undefined) {
+            throw new Error("Popping an empty stack.");
+        }
+        return msg;
+    }
 }
 /* ***************************************************************************/
 /* Stream MUX protocol */
@@ -1156,54 +1297,76 @@ class SKDBServer {
     static getDbSocketUri(endpoint, db) {
         return `${endpoint}/dbs/${db}/connection`;
     }
+    strictCastData(response) {
+        if (response === null) {
+            throw new Error(`Unexpected response: ${response}`);
+        }
+        if (response.type === "data") {
+            return response;
+        }
+        throw new Error(`Unexpected response: ${response}`);
+    }
     async makeRequest(request) {
         const stream = this.connection.openStream();
-        const acc = new Array();
+        const decoder = new ProtoMsgDecoder();
         return new Promise((resolve, reject) => {
             stream.onData = function (data) {
-                acc.push(data);
+                decoder.push(data);
             };
             stream.onClose = () => {
-                const decoder = new TextDecoder();
-                let result = "";
-                for (let i = 0; i < acc.length; i++) {
-                    result = decoder.decode(acc[i], { stream: i < acc.length - 1 });
+                const msg = decoder.pop();
+                if (msg === null || msg.type !== "credentials" && msg.type !== "data") {
+                    resolve(null);
+                    return;
                 }
-                resolve(JSON.parse(result));
+                resolve(msg);
             };
             stream.onError = (_code, msg) => reject(msg);
-            const encoder = new TextEncoder();
-            stream.send(encoder.encode(JSON.stringify(request)));
+            stream.send(encodeProtoMsg(request));
             stream.close();
         });
     }
-    establishServerTail(tableName) {
+    async establishServerTail(tableName) {
         const stream = this.connection.openStream();
         const client = this.client;
-        stream.onError = (code, msg) => {
-            // will go away when we re-introduce the resiliency abstraction
-            console.error("server tail", tableName, "stream errored", code, msg);
-        };
-        stream.onClose = () => {
-            // will go away when we re-introduce the resiliency abstraction
-            console.error("server tail", tableName, "stream closed");
-        };
-        stream.onData = (data) => {
-            const decoder = new TextDecoder();
-            const pData = JSON.parse(decoder.decode(data));
-            const msg = pData.data;
-            client.runLocal(["write-csv", tableName, "--source", this.replicationUid], msg + '\n');
-        };
-        const encoder = new TextEncoder();
-        stream.send(encoder.encode(JSON.stringify({
-            request: "tail",
-            table: tableName,
-            since: this.client.watermark(tableName),
-        })));
+        const decoder = new ProtoMsgDecoder();
+        const objThis = this;
+        let resolved = false;
+        return new Promise((resolve, reject) => {
+            stream.onError = (code, msg) => {
+                // will go away when we re-introduce the resiliency abstraction
+                console.error("server tail", tableName, "stream errored", code, msg);
+                if (!resolved) {
+                    resolved = true;
+                    reject(msg);
+                }
+            };
+            stream.onClose = () => {
+                // will go away when we re-introduce the resiliency abstraction
+                console.error("server tail", tableName, "stream closed");
+            };
+            stream.onData = (data) => {
+                if (decoder.push(data)) {
+                    const msg = decoder.pop();
+                    const txtPayload = decodeUTF8(objThis.strictCastData(msg).payload);
+                    client.runLocal(["write-csv", tableName, "--source", objThis.replicationUid], txtPayload + '\n');
+                    if (!resolved) {
+                        resolved = true;
+                        resolve();
+                    }
+                }
+            };
+            stream.send(encodeProtoMsg({
+                type: "tail",
+                table: tableName,
+                since: objThis.client.watermark(tableName),
+            }));
+        });
     }
     establishLocalTail(tableName) {
         const stream = this.connection.openStream();
         const client = this.client;
+        const decoder = new ProtoMsgDecoder();
         stream.onError = (code, msg) => {
             // will go away when we re-introduce the resiliency abstraction
             console.error("local tail", tableName, "stream errored", code, msg);
@@ -1213,29 +1376,28 @@ class SKDBServer {
             console.error("local tail", tableName, "stream closed");
         };
         stream.onData = (data) => {
-            const decoder = new TextDecoder();
-            const pData = JSON.parse(decoder.decode(data));
-            const msg = pData.data;
-            // we only expect acks back in the form of checkpoints.
-            // let's store these as a watermark against the table.
-            client.runLocal(["write-csv", metadataTable(tableName)], msg + '\n');
+            if (decoder.push(data)) {
+                const msg = decoder.pop();
+                const txtPayload = decodeUTF8(this.strictCastData(msg).payload);
+                // we only expect acks back in the form of checkpoints.
+                // let's store these as a watermark against the table.
+                client.runLocal(["write-csv", metadataTable(tableName)], txtPayload + '\n');
+            }
         };
         const request = {
-            request: "write",
+            type: "pushPromise",
             table: tableName,
         };
-        const encoder = new TextEncoder();
-        stream.send(encoder.encode(JSON.stringify(request)));
+        stream.send(encodeProtoMsg(request));
         let fileName = tableName + "_" + this.creds.accessKey;
         client.watchFile(fileName, change => {
             if (change == "") {
                 return;
             }
-            const encoder = new TextEncoder();
-            stream.send(encoder.encode(JSON.stringify({
-                request: "pipe",
-                data: change,
-            })));
+            stream.send(encodeProtoMsg({
+                type: "data",
+                payload: encodeUTF8Str(change),
+            }));
         });
         const _session = client.runLocal([
             "subscribe", tableName, "--connect", "--format=csv",
@@ -1249,15 +1411,15 @@ class SKDBServer {
         this.mirroredTables.add(tableName);
         // TODO: just assumes that if it exists the schema is the same
         if (!this.client.tableExists(tableName)) {
-            let createTable = await this.tableSchema(tableName, "");
+            let createTable = await this.tableSchema(tableName);
             this.client.runLocal([], createTable);
             this.client.runLocal([], `CREATE TABLE ${metadataTable(tableName)} (
          key STRING PRIMARY KEY,
          value STRING
        )`);
         }
-        this.establishServerTail(tableName);
         this.establishLocalTail(tableName);
+        return this.establishServerTail(tableName);
     }
     // TODO: this currently just replicates the schema locally assuming
     // you have all source tables setup. is this what we want? we should
@@ -1265,82 +1427,69 @@ class SKDBServer {
     // just to create this themselves - no need for mirroring. or we
     // could mirror down a read-only table and have the server keep it
     // in sync?
-    async mirrorView(viewName, suffix) {
-        if (!this.client.viewExists(viewName + suffix)) {
-            suffix = suffix || "";
-            let createRemoteTable = await this.viewSchema(viewName, suffix);
+    async mirrorView(viewName) {
+        if (!this.client.viewExists(viewName)) {
+            let createRemoteTable = await this.viewSchema(viewName);
             this.client.runLocal([], createRemoteTable);
         }
     }
-    castData(response) {
-        if (response.request === "pipe") {
-            return response;
-        }
-        if (response.request == "error") {
-            console.error(response.msg);
-        }
-        else {
-            console.error("Unexpected response", response);
-        }
-        throw new Error(`Unexpected response: ${response}`);
-    }
     async sqlRaw(stdin) {
         let result = await this.makeRequest({
-            request: "query",
+            type: "query",
             query: stdin,
             format: "raw",
         });
-        return this.castData(result).data;
+        return decodeUTF8(this.strictCastData(result).payload);
     }
     async sql(stdin) {
         let result = await this.makeRequest({
-            request: "query",
+            type: "query",
             query: stdin,
             format: "json",
         });
-        return this.castData(result)
-            .data
+        return decodeUTF8(this.strictCastData(result).payload)
             .split("\n")
             .filter((x) => x != "")
             .map((x) => JSON.parse(x));
     }
-    async tableSchema(tableName, renameSuffix = "") {
+    async tableSchema(tableName) {
         const resp = await this.makeRequest({
-            request: "schema",
-            table: tableName,
-            suffix: renameSuffix,
+            type: "schema",
+            name: tableName,
+            scope: "table",
         });
-        return this.castData(resp).data;
+        return decodeUTF8(this.strictCastData(resp).payload);
     }
-    async viewSchema(viewName, renameSuffix = "") {
+    async viewSchema(viewName) {
         const resp = await this.makeRequest({
-            request: "schema",
-            view: viewName,
-            suffix: renameSuffix,
+            type: "schema",
+            name: viewName,
+            scope: "view",
         });
-        return this.castData(resp).data;
+        return decodeUTF8(this.strictCastData(resp).payload);
     }
     async schema() {
         const resp = await this.makeRequest({
-            request: "schema",
+            type: "schema",
+            scope: "all",
         });
-        return this.castData(resp).data;
+        return decodeUTF8(this.strictCastData(resp).payload);
     }
     async createDatabase(dbName) {
         let result = await this.makeRequest({
-            request: "createDatabase",
+            type: "createDatabase",
             name: dbName,
         });
-        if (result.request !== "credentials") {
+        if (result === null || result.type !== "credentials") {
             throw new Error("Unexpected response.");
         }
         return result;
     }
     async createUser() {
         let result = await this.makeRequest({
-            request: "createUser",
+            type: "createUser",
         });
-        if (result.request !== "credentials") {
+        if (result === null || result.type !== "credentials") {
             throw new Error("Unexpected response.");
         }
         return result;
