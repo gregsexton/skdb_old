@@ -233,6 +233,9 @@ export class SKDB {
         if (dbName != null && storeName != null) {
             client.db = await makeSKDBStore(dbName, storeName, version, exports.memory.buffer, exports.SKIP_get_persistent_size(), rebootStatus, client.pageSize);
         }
+        else {
+            rebootStatus.isReboot = true;
+        }
         client.exports.SKIP_init_jsroots();
         client.runSubscribeRoots(rebootStatus.isReboot);
         client.clientUuid = crypto.randomUUID();
@@ -601,7 +604,7 @@ export class SKDB {
 function encodeProtoMsg(msg) {
     switch (msg.type) {
         case "query": {
-            const buf = new ArrayBuffer(6 + msg.query.length * 3);
+            const buf = new ArrayBuffer(6 + msg.query.length * 4);
             const uint8View = new Uint8Array(buf);
             const dataView = new DataView(buf);
             const textEncoder = new TextEncoder();
@@ -622,7 +625,7 @@ function encodeProtoMsg(msg) {
         }
         case "schema": {
             const name = msg.name || "";
-            const buf = new ArrayBuffer(4 + name.length * 3);
+            const buf = new ArrayBuffer(4 + name.length * 4);
             const uint8View = new Uint8Array(buf);
             const dataView = new DataView(buf);
             const textEncoder = new TextEncoder();
@@ -642,7 +645,7 @@ function encodeProtoMsg(msg) {
             return buf.slice(0, 4 + (encodeResult.written || 0));
         }
         case "tail": {
-            const buf = new ArrayBuffer(14 + msg.table.length * 3);
+            const buf = new ArrayBuffer(14 + msg.table.length * 4);
             const uint8View = new Uint8Array(buf);
             const dataView = new DataView(buf);
             const textEncoder = new TextEncoder();
@@ -653,7 +656,7 @@ function encodeProtoMsg(msg) {
             return buf.slice(0, 14 + (encodeResult.written || 0));
         }
         case "pushPromise": {
-            const buf = new ArrayBuffer(6 + msg.table.length * 3);
+            const buf = new ArrayBuffer(6 + msg.table.length * 4);
             const uint8View = new Uint8Array(buf);
             const dataView = new DataView(buf);
             const textEncoder = new TextEncoder();
@@ -663,7 +666,7 @@ function encodeProtoMsg(msg) {
             return buf.slice(0, 6 + (encodeResult.written || 0));
         }
         case "createDatabase": {
-            const buf = new ArrayBuffer(3 + msg.name.length * 3);
+            const buf = new ArrayBuffer(3 + msg.name.length * 4);
             const uint8View = new Uint8Array(buf);
             const dataView = new DataView(buf);
             const textEncoder = new TextEncoder();
@@ -774,6 +777,175 @@ class ProtoMsgDecoder {
         return msg;
     }
 }
+class ResilientMuxedSocket {
+    async openStream() {
+        const socket = await this.getSocket();
+        return socket.openStream();
+    }
+    async openResilientStream() {
+        const socket = await this.getSocket();
+        return new ResilientStream(this, socket.openStream());
+    }
+    async closeSocket() {
+        const socket = this.socket ?? await this.getSocket();
+        this.socket = undefined;
+        this.socketQueue = new Array();
+        socket.closeSocket();
+    }
+    async errorSocket(errorCode, msg) {
+        const socket = this.socket ?? await this.getSocket();
+        this.socket = undefined;
+        this.socketQueue = new Array();
+        socket.errorSocket(errorCode, msg);
+    }
+    async isSocketResponsive() {
+        if (!this.socket) {
+            return false;
+        }
+        return this.socket.pingSocket();
+    }
+    static async connect(policy, uri, creds) {
+        const socket = await MuxedSocket.connect(uri, creds);
+        return new ResilientMuxedSocket(policy, uri, creds, socket);
+    }
+    constructor(policy, uri, creds, initialSocket) {
+        this.socketQueue = new Array();
+        this.attachSocket(initialSocket);
+        this.policy = policy;
+        this.uri = uri;
+        this.creds = creds;
+    }
+    async getSocket() {
+        if (this.socket) {
+            return this.socket;
+        }
+        return new Promise((resolve, reject) => {
+            this.socketQueue.push({ resolve: resolve, reject: reject });
+        });
+    }
+    attachSocket(socket) {
+        socket.onStream = (stream) => {
+            if (this.onStream) {
+                this.onStream(stream);
+            }
+        };
+        socket.onClose = () => {
+            this.replaceFailedSocket();
+        };
+        socket.onError = (_errorCode, _msg) => {
+            this.replaceFailedSocket();
+        };
+        this.socket = socket;
+        for (const promise of this.socketQueue) {
+            promise.resolve(socket);
+        }
+        this.socketQueue = new Array();
+    }
+    async replaceFailedSocket() {
+        if (!this.socket) {
+            return; // already reconnecting
+        }
+        const oldSocket = this.socket;
+        this.socket.onStream = undefined;
+        this.socket.onClose = undefined;
+        this.socket.onError = undefined;
+        this.socket = undefined;
+        oldSocket.errorSocket(128, "Socket suspected to have failed");
+        while (true) {
+            try {
+                const socket = await MuxedSocket.connect(this.uri, this.creds);
+                this.attachSocket(socket);
+                return;
+            }
+            catch (error) {
+                const backoffMs = 500 + Math.random() * 1000;
+                await new Promise(resolve => setTimeout(resolve, backoffMs));
+            }
+        }
+    }
+    // interface used by ResilientStream
+    async replaceFailedStream() {
+        this.policy.notifyFailedStream();
+        if (await this.policy.shouldReconnect(this)) {
+            this.replaceFailedSocket();
+        }
+        const socket = await this.getSocket();
+        try {
+            return socket.openStream();
+        }
+        catch {
+            await this.replaceFailedSocket();
+            return this.replaceFailedStream();
+        }
+    }
+}
+class ResilientStream {
+    setFailureDetectionTimeout(timeout) {
+        clearTimeout(this.failureDetectionTimeout);
+        this.failureDetectionTimeout = timeout;
+    }
+    send(data) {
+        if (!this.stream) {
+            // black hole the data. we're reconnecting and will call
+            // onReconnect that should address the gap
+            return;
+        }
+        this.stream.send(data);
+    }
+    expectingData() {
+        if (this.failureDetectionTimeout) {
+            // already expecting a response and hasn't arrived
+            return;
+        }
+        if (!this.stream) {
+            // we're reconnecting
+            return;
+        }
+        const failureThresholdMs = 60000;
+        const timeout = setTimeout(() => {
+            this.replaceFailedStream();
+        }, failureThresholdMs);
+        this.setFailureDetectionTimeout(timeout);
+    }
+    attachStream(stream) {
+        stream.onData = (data) => {
+            // data received; connection is healthy
+            this.setFailureDetectionTimeout(undefined);
+            if (this.onData) {
+                this.onData(data);
+            }
+        };
+        stream.onClose = () => {
+            this.replaceFailedStream();
+        };
+        stream.onError = (_errorCode, _msg) => {
+            this.replaceFailedStream();
+        };
+        this.stream = stream;
+    }
+    async replaceFailedStream() {
+        if (!this.stream) {
+            return; // already reconnecting
+        }
+        const oldStream = this.stream;
+        oldStream.onData = undefined;
+        oldStream.onClose = undefined;
+        oldStream.onError = undefined;
+        this.stream = undefined;
+        this.setFailureDetectionTimeout(undefined);
+        // if it _has_ failed, this is a no-op, otherwise it protects invariants
+        oldStream.error(128, "Stream suspected to have failed");
+        const newStream = await this.socket.replaceFailedStream();
+        this.attachStream(newStream);
+        if (this.onReconnect) {
+            this.onReconnect();
+        }
+    }
+    constructor(socket, stream) {
+        this.socket = socket;
+        this.attachStream(stream);
+    }
+}
 /* ***************************************************************************/
 /* Stream MUX protocol */
 /* ***************************************************************************/
@@ -793,6 +965,7 @@ export class MuxedSocket {
         this.activeStreams = new Map();
         this.serverStreamWatermark = 0;
         this.nextStream = 1;
+        this.healthChecks = new Array();
         // pre-condition: socket is open
         this.socket = socket;
     }
@@ -853,7 +1026,10 @@ export class MuxedSocket {
             case MuxedSocketState.AUTH_SENT:
             case MuxedSocketState.CLOSEWAIT: {
                 for (const stream of this.activeStreams.values()) {
-                    stream.error(errorCode, msg);
+                    // this is different to closing. we just immediately trigger
+                    // callbacks on streams and only send the goaway for socket.
+                    // this is because erroring is not reciprocated by the server
+                    stream.onStreamError(errorCode, msg);
                 }
                 this.activeStreams.clear();
                 this.state = MuxedSocketState.CLOSED;
@@ -864,15 +1040,44 @@ export class MuxedSocket {
             }
         }
     }
-    static async connect(uri, creds) {
+    async pingSocket() {
+        switch (this.state) {
+            case MuxedSocketState.IDLE:
+            case MuxedSocketState.CLOSING:
+            case MuxedSocketState.CLOSED:
+                return false;
+            case MuxedSocketState.AUTH_SENT:
+            case MuxedSocketState.CLOSEWAIT:
+                return new Promise((resolve, _reject) => {
+                    this.socket.send(this.encodePingMsg());
+                    const pingTimeoutMs = 10000;
+                    const timeout = setTimeout(() => resolve(false), pingTimeoutMs);
+                    this.healthChecks.push((isOk) => {
+                        clearTimeout(timeout);
+                        resolve(isOk);
+                    });
+                });
+        }
+    }
+    static async connect(uri, creds, timeoutMs = 60000) {
         const auth = await MuxedSocket.encodeAuthMsg(creds);
         return new Promise((resolve, reject) => {
+            let failed = false;
+            const timeout = setTimeout(() => {
+                failed = true;
+                reject(new Error("Timeout waiting to connect"));
+            }, timeoutMs);
             const socket = new WebSocket(uri);
             socket.binaryType = "arraybuffer";
             socket.onclose = (_event) => reject(new Error("Socket closed before open"));
             socket.onerror = (event) => reject(event);
             socket.onmessage = (_event) => reject(new Error("Socket messaged before open"));
             socket.onopen = (_event) => {
+                clearTimeout(timeout);
+                if (failed) {
+                    socket.close();
+                    return;
+                }
                 const muxSocket = new MuxedSocket(socket);
                 socket.onclose = (event) => muxSocket.onSocketClose(event);
                 socket.onerror = (_event) => muxSocket.onSocketError(0, "socket error");
@@ -978,7 +1183,8 @@ export class MuxedSocket {
                 }
                 const msg = this.decode(event.data);
                 if (msg === null) {
-                    // for robustness we ignore messages we don't understand
+                    // for robustness we ignore messages we don't understand, or
+                    // may have been handled e.g. ping
                     return;
                 }
                 switch (msg.type) {
@@ -1045,7 +1251,7 @@ export class MuxedSocket {
     }
     static async encodeAuthMsg(creds) {
         const enc = new TextEncoder();
-        const buf = new ArrayBuffer(96);
+        const buf = new ArrayBuffer(132);
         const uint8View = new Uint8Array(buf);
         const dataView = new DataView(buf);
         const now = (new Date()).toISOString();
@@ -1061,12 +1267,16 @@ export class MuxedSocket {
             throw new Error("Unable to encode access key");
         }
         uint8View.set(new Uint8Array(sig), 36);
-        const encodeIsoDate = enc.encodeInto(now, uint8View.subarray(69));
+        const encodeDeviceId = enc.encodeInto(creds.deviceUuid, uint8View.subarray(68));
+        if (!encodeDeviceId.written || encodeDeviceId.written != 36) {
+            throw new Error("Unable to encode device id");
+        }
+        const encodeIsoDate = enc.encodeInto(now, uint8View.subarray(105));
         switch (encodeIsoDate.written) {
             case 24:
-                return buf.slice(0, 93);
+                return buf.slice(0, 129);
             case 27:
-                dataView.setUint8(68, 0x1);
+                dataView.setUint8(104, 0x1);
                 return buf;
             default:
                 throw new Error("Unexpected ISO date length");
@@ -1076,7 +1286,7 @@ export class MuxedSocket {
         if (lastStream >= 2 ** 24) {
             throw new Error("Cannot encode lastStream");
         }
-        const buf = new ArrayBuffer(16 + msg.length * 3); // avoid resizing
+        const buf = new ArrayBuffer(16 + msg.length * 4); // avoid resizing
         const uint8View = new Uint8Array(buf);
         const textEncoder = new TextEncoder();
         const encodeResult = textEncoder.encodeInto(msg, uint8View.subarray(16));
@@ -1086,6 +1296,18 @@ export class MuxedSocket {
         dataView.setUint32(8, errorCode, false);
         dataView.setUint32(12, encodeResult.written || 0, false);
         return buf.slice(0, 16 + (encodeResult.written || 0));
+    }
+    encodePingMsg() {
+        const buf = new ArrayBuffer(4);
+        const dataView = new DataView(buf);
+        dataView.setUint8(0, 0x5); // type
+        return buf;
+    }
+    encodePongMsg() {
+        const buf = new ArrayBuffer(4);
+        const dataView = new DataView(buf);
+        dataView.setUint8(0, 0x6); // type
+        return buf;
     }
     encodeStreamDataMsg(stream, data) {
         if (stream >= 2 ** 24) {
@@ -1112,7 +1334,7 @@ export class MuxedSocket {
             throw new Error("Cannot encode stream");
         }
         const textEncoder = new TextEncoder();
-        const buf = new ArrayBuffer(12 + msg.length * 3); // avoid resizing
+        const buf = new ArrayBuffer(12 + msg.length * 4); // avoid resizing
         const uint8View = new Uint8Array(buf);
         const dataView = new DataView(buf);
         dataView.setUint32(0, 0x4 << 24 | stream, false); // type and stream id
@@ -1168,6 +1390,31 @@ export class MuxedSocket {
                     errorCode: dv.getUint32(4, false),
                     msg: errorMsg,
                 };
+            }
+            case 5: { // ping
+                if (stream != 0) {
+                    return null;
+                }
+                switch (this.state) {
+                    case MuxedSocketState.AUTH_SENT:
+                    case MuxedSocketState.CLOSEWAIT:
+                        this.socket.send(this.encodePongMsg());
+                        break;
+                    case MuxedSocketState.IDLE:
+                    case MuxedSocketState.CLOSING:
+                    case MuxedSocketState.CLOSED:
+                        break;
+                }
+                return null;
+            }
+            case 6: { // pong
+                if (stream != 0) {
+                    return null;
+                }
+                for (const resolve of this.healthChecks) {
+                    resolve(true);
+                }
+                return null;
             }
             default:
                 return null;
@@ -1286,7 +1533,14 @@ class SKDBServer {
     }
     static async connect(client, endpoint, db, creds) {
         const uri = SKDBServer.getDbSocketUri(endpoint, db);
-        const conn = await MuxedSocket.connect(uri, creds);
+        const policy = {
+            notifyFailedStream() { },
+            async shouldReconnect(socket) {
+                // perform an active check
+                return !socket.isSocketResponsive();
+            }
+        };
+        const conn = await ResilientMuxedSocket.connect(policy, uri, creds);
         const server = new SKDBServer(client, conn, creds);
         server.replicationUid = client.runLocal(["uid"], "").trim();
         return server;
@@ -1307,7 +1561,7 @@ class SKDBServer {
         throw new Error(`Unexpected response: ${response}`);
     }
     async makeRequest(request) {
-        const stream = this.connection.openStream();
+        const stream = await this.connection.openStream();
         const decoder = new ProtoMsgDecoder();
         return new Promise((resolve, reject) => {
             stream.onData = function (data) {
@@ -1327,54 +1581,43 @@ class SKDBServer {
         });
     }
     async establishServerTail(tableName) {
-        const stream = this.connection.openStream();
+        const stream = await this.connection.openResilientStream();
         const client = this.client;
         const decoder = new ProtoMsgDecoder();
-        const objThis = this;
         let resolved = false;
-        return new Promise((resolve, reject) => {
-            stream.onError = (code, msg) => {
-                // will go away when we re-introduce the resiliency abstraction
-                console.error("server tail", tableName, "stream errored", code, msg);
-                if (!resolved) {
-                    resolved = true;
-                    reject(msg);
-                }
-            };
-            stream.onClose = () => {
-                // will go away when we re-introduce the resiliency abstraction
-                console.error("server tail", tableName, "stream closed");
-            };
+        return new Promise((resolve, _reject) => {
             stream.onData = (data) => {
                 if (decoder.push(data)) {
                     const msg = decoder.pop();
-                    const txtPayload = decodeUTF8(objThis.strictCastData(msg).payload);
-                    client.runLocal(["write-csv", tableName, "--source", objThis.replicationUid], txtPayload + '\n');
+                    const txtPayload = decodeUTF8(this.strictCastData(msg).payload);
+                    client.runLocal(["write-csv", tableName, "--source", this.replicationUid], txtPayload + '\n');
                     if (!resolved) {
                         resolved = true;
                         resolve();
                     }
                 }
+                stream.expectingData();
+            };
+            stream.onReconnect = () => {
+                stream.send(encodeProtoMsg({
+                    type: "tail",
+                    table: tableName,
+                    since: this.client.watermark(tableName),
+                }));
+                stream.expectingData();
             };
             stream.send(encodeProtoMsg({
                 type: "tail",
                 table: tableName,
-                since: objThis.client.watermark(tableName),
+                since: this.client.watermark(tableName),
             }));
+            stream.expectingData();
         });
     }
-    establishLocalTail(tableName) {
-        const stream = this.connection.openStream();
+    async establishLocalTail(tableName) {
+        const stream = await this.connection.openResilientStream();
         const client = this.client;
         const decoder = new ProtoMsgDecoder();
-        stream.onError = (code, msg) => {
-            // will go away when we re-introduce the resiliency abstraction
-            console.error("local tail", tableName, "stream errored", code, msg);
-        };
-        stream.onClose = () => {
-            // will go away when we re-introduce the resiliency abstraction
-            console.error("local tail", tableName, "stream closed");
-        };
         stream.onData = (data) => {
             if (decoder.push(data)) {
                 const msg = decoder.pop();
@@ -1398,11 +1641,28 @@ class SKDBServer {
                 type: "data",
                 payload: encodeUTF8Str(change),
             }));
+            stream.expectingData();
         });
-        const _session = client.runLocal([
+        const session = client.runLocal([
             "subscribe", tableName, "--connect", "--format=csv",
             "--updates", fileName, "--ignore-source", this.replicationUid
         ], "").trim();
+        stream.onReconnect = () => {
+            stream.send(encodeProtoMsg(request));
+            const diff = client.runLocal([
+                "diff", "--format=csv",
+                "--since", client.watermark(metadataTable(tableName)).toString(),
+                session,
+            ], "");
+            if (diff == "") {
+                return;
+            }
+            stream.send(encodeProtoMsg({
+                type: "data",
+                payload: encodeUTF8Str(diff),
+            }));
+            stream.expectingData();
+        };
     }
     async mirrorTable(tableName) {
         if (this.mirroredTables.has(tableName)) {
@@ -1418,20 +1678,10 @@ class SKDBServer {
          value STRING
        )`);
         }
-        this.establishLocalTail(tableName);
+        // TODO: need to join the promises but let them run concurrently
+        // I await here for now so we learn of error
+        await this.establishLocalTail(tableName);
         return this.establishServerTail(tableName);
-    }
-    // TODO: this currently just replicates the schema locally assuming
-    // you have all source tables setup. is this what we want? we should
-    // error if this doesn't succeed. it might be easier for the user
-    // just to create this themselves - no need for mirroring. or we
-    // could mirror down a read-only table and have the server keep it
-    // in sync?
-    async mirrorView(viewName) {
-        if (!this.client.viewExists(viewName)) {
-            let createRemoteTable = await this.viewSchema(viewName);
-            this.client.runLocal([], createRemoteTable);
-        }
     }
     async sqlRaw(stdin) {
         let result = await this.makeRequest({
