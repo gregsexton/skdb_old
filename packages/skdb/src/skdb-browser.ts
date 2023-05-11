@@ -37,6 +37,7 @@ interface WasmExports {
   SKIP_tracked_call: (funId: number, funArg: number) => number;
   SKIP_tracked_query: (request: number, start: number, end: number) => number;
   skip_main: () => void;
+  getVersion: () => number;
   memory: Memory;
 }
 
@@ -81,17 +82,12 @@ function clearSKDBStore(
   });
 }
 
-class RebootStatus {
-  isReboot: boolean = false;
-}
-
 function makeSKDBStore(
   dbName: string,
   storeName: string,
   version: number,
   memory: ArrayBuffer,
   memorySize: number,
-  rebootStatus: RebootStatus,
   pageSize: number
 ): Promise<IDBDatabase> {
   if (typeof indexedDB === 'undefined') {
@@ -126,7 +122,6 @@ function makeSKDBStore(
               { result: Array<{pageid: number, content: ArrayBuffer}>}
             ).result;
         if(pages.length == 0) {
-          rebootStatus.isReboot = true;
           let i;
           let cursor = 0;
           for (i = 0; i < memorySize / pageSize; i++) {
@@ -277,6 +272,7 @@ export class SKDB {
   // @ts-expect-error
   private exports: WasmExports;
   private clientUuid: string = "";
+  private version: string = "unknown";
 
   server?: SKDBServer;
 
@@ -314,7 +310,6 @@ export class SKDB {
     exports.SKIP_skfs_end_of_init();
     client.nbrInitPages = exports.SKIP_get_persistent_size() / client.pageSize + 1;
     let version = exports.SKIP_get_version();
-    let rebootStatus = new RebootStatus();
     if(dbName != null && storeName != null) {
       client.db = await makeSKDBStore(
         dbName,
@@ -322,17 +317,15 @@ export class SKDB {
         version,
         exports.memory.buffer,
         exports.SKIP_get_persistent_size(),
-        rebootStatus,
         client.pageSize
       );
-    } else {
-      rebootStatus.isReboot = true;
     }
 
     client.exports.SKIP_init_jsroots();
-    client.runSubscribeRoots(rebootStatus.isReboot);
+    client.runSubscribeRoots();
 
     client.clientUuid = crypto.randomUUID();
+    client.version = wasmStringToJS(exports, exports.getVersion());
 
     return client;
   }
@@ -607,7 +600,7 @@ export class SKDB {
     return this.stdout.join("");
   }
 
-  runSubscribeRoots(reboot: boolean): void {
+  runSubscribeRoots(): void {
     this.roots = new Map();
     let fileName = "/subscriptions/jsroots";
     this.watchFile(fileName, (text) => {
@@ -632,12 +625,10 @@ export class SKDB {
       }
     });
     this.subscriptionCount++;
-    if(reboot) {
-      this.runLocal(
-        ["subscribe", "jsroots", "--format=json", "--updates", fileName],
-        ""
-      );
-    }
+    this.runLocal(
+      ["subscribe", "jsroots", "--format=json", "--updates", fileName],
+      ""
+    );
   }
 
   watermark(table: string): bigint {
