@@ -10,7 +10,7 @@ function App() {
 
   useEffect(() => {
     const runSKDB = async () => {
-      const skdb = await SKDB.create(resetSKDBOnReload)
+      const skdb = await SKDB.create(null)
       skdb.sql('CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT)')
       skdb.sql(`INSERT INTO test (id, name) VALUES (1, 'test')`)
       const result = skdb.sql('SELECT * FROM test')

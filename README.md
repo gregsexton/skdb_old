@@ -6,3 +6,15 @@ SKDB can also process ephemeral streams of data which can be used to receive ale
 
 ## Concurrent
 SKDB is inspired by SQLite and supports the same subset of SQL (including transactions). What sets it apart is that it is also highly concurrent. SKDB supports processing complex queries from multiple simultaneous readers/writers without stalling other database users.
+
+
+## Build from source
+
+You will need to have installed `npm` and `yarn`. Then execute the following
+commands in this order:
+
+```sh
+$ cd skdb
+$ yarn install
+$ make npm
+```
