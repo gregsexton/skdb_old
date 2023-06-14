@@ -3,6 +3,7 @@ npm: clean
 	yarn tsc --build tsconfig.all.json
 	./inlineWasm.sh
 	chmod +x packages/skdb/dist/skdb-cli.js
+	cp packages/skdb/skdb.wasm packages/skdb/dist/skdb.wasm
 
 .PHONY: clean
 clean:
