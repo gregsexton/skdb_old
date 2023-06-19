@@ -1,9 +1,11 @@
+import { npmVersion } from './version.js'
+
 /* ***************************************************************************/
 /* WASM Loading. */
 /* ***************************************************************************/
 
 export async function fetchWasmSource(): Promise<Uint8Array> {
-  let wasmModule = await fetch(new URL("../skdb.wasm", import.meta.url));
+  let wasmModule = await fetch(new URL("./skdb.wasm", import.meta.url));
   let wasmBuffer = await wasmModule.arrayBuffer();
   return new Uint8Array(wasmBuffer);
 }
@@ -747,6 +749,14 @@ export class SKDB {
       "insert into " + tableName + " values (" + values.join(", ") + ");";
     this.runLocal([], stdin);
   }
+
+  assertCanBeMirrored(tableName: string): void {
+    const error = this.runLocal(["can-mirror", tableName], "");
+    if (error === "") {
+      return
+    }
+    throw new Error(error);
+  }
 }
 
 /* ***************************************************************************/
@@ -769,6 +779,7 @@ type ProtoRequestTail = {
   type: "tail";
   table: string;
   since: bigint;
+  filterExpr: string;
 }
 
 type ProtoPushPromise = {
@@ -847,15 +858,21 @@ function encodeProtoMsg(msg: ProtoMsg): ArrayBuffer {
         return buf.slice(0, 4 + (encodeResult.written || 0));
       }
       case "tail": {
-        const buf = new ArrayBuffer(14 + msg.table.length * 4);
+        const buf = new ArrayBuffer(16 + msg.table.length * 4 + msg.filterExpr.length * 4);
         const uint8View = new Uint8Array(buf);
         const dataView = new DataView(buf);
         const textEncoder = new TextEncoder();
-        const encodeResult = textEncoder.encodeInto(msg.table, uint8View.subarray(14));
+        let encodeResult = textEncoder.encodeInto(msg.table, uint8View.subarray(14));
         dataView.setUint8(0, 0x2);  // type
         dataView.setBigUint64(4, msg.since, false);
         dataView.setUint16(12, encodeResult.written || 0, false);
-        return buf.slice(0, 14 + (encodeResult.written || 0));
+        const filterExprOffset = 14 + (encodeResult.written || 0);
+        encodeResult = textEncoder.encodeInto(
+          msg.filterExpr,
+          uint8View.subarray(filterExprOffset + 2),
+        );
+        dataView.setUint16(filterExprOffset, encodeResult.written || 0, false);
+        return buf.slice(0, filterExprOffset + 2 + (encodeResult.written || 0));
       }
       case "pushPromise": {
         const buf = new ArrayBuffer(6 + msg.table.length * 4);
@@ -983,6 +1000,18 @@ class ProtoMsgDecoder {
     }
     return msg;
   }
+
+  // returns the last message assembled and clears it off the stack.
+  // useful if tracking the return from push is annoying. null
+  // ambiguously represents receiving a message from a future schema
+  // that we don't understand or empty stack.
+  tryPop(): ProtoMsg | null {
+    const msg = this.msgs.pop();
+    if (msg === undefined) {
+      return null;
+    }
+    return msg;
+  }
 }
 
 /* ***************************************************************************/
@@ -1001,6 +1030,7 @@ class ResilientMuxedSocket {
   private policy: ResiliencyPolicy;
   private socket?: MuxedSocket;
   private socketQueue: Array<any> = new Array();
+  private permanentFailureReason?: string;
 
   // streams from the server are not resilient
   onStream?: (stream: Stream) => void;
@@ -1056,12 +1086,28 @@ class ResilientMuxedSocket {
   }
 
   private async getSocket(): Promise<MuxedSocket> {
+    if (this.permanentFailureReason !== undefined) {
+      throw new Error(this.permanentFailureReason);
+    }
     if (this.socket) {
       return this.socket;
     }
     return new Promise((resolve, reject) => {
       this.socketQueue.push({resolve: resolve, reject: reject});
     });
+  }
+
+  private isSocketErrorRetryable(errorCode: number): boolean {
+    if (errorCode === 1002) {
+      // auth failure - no point in retrying.
+      return false;
+    }
+    if (errorCode === 1004) {
+      // connection request failure - user error - bad uri? - no point
+      // in retrying
+      return false;
+    }
+    return true;
   }
 
   private attachSocket(socket: MuxedSocket): void {
@@ -1073,7 +1119,15 @@ class ResilientMuxedSocket {
     socket.onClose = () => {
       this.replaceFailedSocket();
     };
-    socket.onError = (_errorCode, _msg) => {
+    socket.onError = (errorCode, msg) => {
+      if (!this.isSocketErrorRetryable(errorCode)) {
+        // we do not have a way of communicating upward that we're in
+        // a non-retryable state. there are very few cases where this
+        // can happen and they're checked for explicitly.
+        this.permanentFailureReason = msg;
+        this.socket = undefined;
+        return;
+      }
       this.replaceFailedSocket();
     };
     this.socket = socket;
@@ -1084,6 +1138,9 @@ class ResilientMuxedSocket {
   }
 
   private async replaceFailedSocket(): Promise<void> {
+    if (this.permanentFailureReason !== undefined) {
+      return;
+    }
     if (!this.socket) {
       return; // already reconnecting
     }
@@ -1093,7 +1150,10 @@ class ResilientMuxedSocket {
     this.socket.onClose = undefined;
     this.socket.onError = undefined;
     this.socket = undefined;
-    oldSocket.errorSocket(128, "Socket suspected to have failed");
+    oldSocket.errorSocket(0, "Socket suspected to have failed");
+
+    const backoffMs = 500 + Math.random() * 1000;
+    await new Promise(resolve => setTimeout(resolve, backoffMs));
 
     while (true) {
       try {
@@ -1165,6 +1225,8 @@ class ResilientStream {
     const timeout = setTimeout(() => {
       this.replaceFailedStream();
     }, failureThresholdMs)
+    // TODO: Fix the following error.
+    // @ts-ignore
     this.setFailureDetectionTimeout(timeout);
   }
 
@@ -1180,6 +1242,9 @@ class ResilientStream {
       this.replaceFailedStream();
     };
     stream.onError = (_errorCode, _msg) => {
+      // we ignore the error code and attempt to re-establish the
+      // stream from scratch, which should resolve the issue even if
+      // it wasn't in a retryable state.
       this.replaceFailedStream();
     };
     this.stream = stream;
@@ -1196,7 +1261,7 @@ class ResilientStream {
     this.stream = undefined;
     this.setFailureDetectionTimeout(undefined);
     // if it _has_ failed, this is a no-op, otherwise it protects invariants
-    oldStream.error(128, "Stream suspected to have failed");
+    oldStream.error(0, "Stream suspected to have failed");
     const newStream = await this.socket.replaceFailedStream();
     this.attachStream(newStream);
     if (this.onReconnect) {
@@ -1346,7 +1411,7 @@ export class MuxedSocket {
       this.state = MuxedSocketState.CLOSED;
       const lastStream = Math.max(this.nextStream - 2, this.serverStreamWatermark);
       this.socket.send(this.encodeGoawayMsg(lastStream, errorCode, msg));
-      this.socket.close(1002);
+      this.socket.close(4000);
       break;
     }
     }
@@ -1487,7 +1552,7 @@ export class MuxedSocket {
     case MuxedSocketState.CLOSING:
     case MuxedSocketState.CLOSEWAIT:
       for (const stream of this.activeStreams.values()) {
-        stream.onStreamError(0, msg);
+        stream.onStreamError(errorCode, msg);
       }
       if (this.onError) {
         this.onError(errorCode, msg);
@@ -1577,8 +1642,9 @@ export class MuxedSocket {
   }
 
   private static async encodeAuthMsg(creds: Creds): Promise<ArrayBuffer> {
+    const clientVersion = "js-" + npmVersion;
     const enc = new TextEncoder();
-    const buf = new ArrayBuffer(132);
+    const buf = new ArrayBuffer(133 + clientVersion.length);
     const uint8View = new Uint8Array(buf);
     const dataView = new DataView(buf);
 
@@ -1604,16 +1670,26 @@ export class MuxedSocket {
     if (!encodeDeviceId.written || encodeDeviceId.written != 36) {
       throw new Error("Unable to encode device id")
     }
-    const encodeIsoDate = enc.encodeInto(now, uint8View.subarray(105));
+    let pos = 105;
+    const encodeIsoDate = enc.encodeInto(now, uint8View.subarray(pos));
     switch (encodeIsoDate.written) {
-    case 24:
-      return buf.slice(0, 129);
-    case 27:
-      dataView.setUint8(104, 0x1);
-      return buf;
-    default:
-      throw new Error("Unexpected ISO date length");
+      case 24:
+        pos = 129;
+        break;
+      case 27:
+        dataView.setUint8(104, 0x1);
+        pos = 132;
+        break;
+      default:
+        throw new Error("Unexpected ISO date length");
     }
+    const encodeClientVersion = enc.encodeInto(clientVersion, uint8View.subarray(pos+1));
+    if (encodeClientVersion.written && encodeClientVersion.written > 255) {
+      throw new Error("Client version too long to encode")
+    }
+    dataView.setUint8(pos, encodeClientVersion.written || 0);
+    pos = pos + 1 + (encodeClientVersion.written || 0);
+    return buf.slice(0, pos);
   }
 
   private encodeGoawayMsg(lastStream: number, errorCode: number, msg: string): ArrayBuffer {
@@ -1950,7 +2026,7 @@ class SKDBServer {
         decoder.push(data);
       };
       stream.onClose = () => {
-        const msg = decoder.pop();
+        const msg = decoder.tryPop();
         if (msg === null || msg.type !== "credentials" && msg.type !== "data") {
           resolve(null);
           return;
@@ -1963,19 +2039,23 @@ class SKDBServer {
     });
   }
 
-  private async establishServerTail(tableName: string): Promise<void> {
+  private async establishServerTail(tableName: string, filterExpr: string): Promise<void> {
     const stream = await this.connection.openResilientStream();
     const client = this.client;
     const decoder = new ProtoMsgDecoder();
 
     let resolved = false;
 
+    // TODO: discover failure and reject. this could happen if e.g.
+    // the table is dropped, acls, bad filter, etc.
     return new Promise((resolve, _reject) => {
       stream.onData = (data) => {
         if (decoder.push(data)) {
           const msg = decoder.pop();
           const txtPayload = decodeUTF8(this.strictCastData(msg).payload);
-          client.runLocal(["write-csv", tableName, "--source", this.replicationUid], txtPayload + '\n');
+          client.runLocal([
+            "write-csv", tableName, "--source", this.replicationUid
+          ], txtPayload + '\n');
           if (!resolved) {
             resolved = true;
             resolve();
@@ -1989,6 +2069,7 @@ class SKDBServer {
           type: "tail",
           table: tableName,
           since: this.client.watermark(this.replicationUid, tableName),
+          filterExpr: filterExpr,
         }))
         stream.expectingData();
       };
@@ -1997,6 +2078,7 @@ class SKDBServer {
         type: "tail",
         table: tableName,
         since: this.client.watermark(this.replicationUid, tableName),
+        filterExpr: filterExpr,
       }));
       stream.expectingData();
     });
@@ -2070,7 +2152,7 @@ class SKDBServer {
     };
   }
 
-  async mirrorTable(tableName: string): Promise<void> {
+  async mirrorTable(tableName: string, filterExpr?: string): Promise<void> {
     if (this.mirroredTables.has(tableName)) {
       return;
     }
@@ -2088,10 +2170,12 @@ class SKDBServer {
        )`);
     }
 
+    this.client.assertCanBeMirrored(tableName);
+
     // TODO: need to join the promises but let them run concurrently
     // I await here for now so we learn of error
     await this.establishLocalTail(tableName);
-    return this.establishServerTail(tableName);
+    return this.establishServerTail(tableName, filterExpr || "");
   }
 
   async sqlRaw(stdin: string): Promise<string> {
